@@ -15,7 +15,6 @@ logs/
 outputs/
 
 # Models & checkpoints
-models/
 checkpoints/
 *.pt
 *.bin
