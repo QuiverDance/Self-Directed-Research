@@ -13,7 +13,6 @@ notebook
 dataset
 output_samples
 *.pdf
-*.json
 *.jsonl
 third_party
 speed_logs
