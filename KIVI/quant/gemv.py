@@ -11,8 +11,6 @@ from new_pack import pack_tensor
 from timeit_v2 import py_benchmark
 import kivi_gemv
 
-test_bgemv_outer_correct_mha
-
 B, nh, IC, OC = 8, 32, 739, 128
 
 @triton.jit
