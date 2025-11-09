@@ -15,8 +15,7 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions andpython kivi_smoke_mistral.py
-
+# See the License for the specific language governing permissions and
 # limitations under the License.
 """ PyTorch Mistral model."""
 import inspect
@@ -162,11 +161,7 @@ class MistralAttention_KIVI(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[-1]
-        # Ensure position_ids for window [kv_seq_len-q_len, kv_seq_len)
-        if position_ids is None:
-            start_pos = kv_seq_len - q_len
-            position_ids = torch.arange(start_pos, kv_seq_len, device=value_states.device).unsqueeze(0)
-        cos, sin = self.rotary_emb(value_states, position_ids=position_ids)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -381,7 +376,7 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
 
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
-        cos, sin = self.rotary_emb(value_states, position_ids=position_ids)
+        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
