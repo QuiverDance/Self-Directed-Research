@@ -22,7 +22,7 @@
 import inspect
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.nn.functional as F
@@ -100,7 +100,7 @@ class MistralAttention_KIVI(nn.Module):
     and "Generating Long Sequences with Sparse Transformers".
     """
 
-    def __init__(self, config: MistralConfig):
+    def __init__(self, config: MistralConfig, nbits_key: int, nbits_value: int):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -111,8 +111,12 @@ class MistralAttention_KIVI(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
-        self.k_bits = config.k_bits
-        self.v_bits = config.v_bits
+
+        # KVTuner: Set k_bits and v_bits from the passed arguments, not the global config.
+        # This is the core change for applying layer-wise quantization.
+        self.k_bits = nbits_key
+        self.v_bits = nbits_value
+
         self.group_size = config.group_size
         self.residual_length = config.residual_length
 
@@ -347,6 +351,12 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
     flash attention and deal with padding tokens in case the input contains any of them.
     """
+
+    # KVTuner: Add an __init__ method to accept and set layer-specific nbits, just like the parent class.
+    def __init__(self, config: MistralConfig, nbits_key: int, nbits_value: int):
+        # Call the parent's __init__ method.
+        # super() will call MistralAttention_KIVI.__init__ which already contains our logic.
+        super().__init__(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
 
     def forward(
         self,
@@ -703,13 +713,16 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
 
 
 class MistralDecoderLayer_KIVI(nn.Module):
-    def __init__(self, config: MistralConfig):
+    def __init__(self, config: MistralConfig, nbits_key: int, nbits_value: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        # KVTuner: Pass the layer-specific nbits to the attention module.
         self.self_attn = (
-            MistralAttention_KIVI(config=config)
+            MistralAttention_KIVI(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
             if not getattr(config, "use_flash", False)
-            else MistralFlashAttention_KIVI(config)
+            # Note: For simplicity, this example only shows the modification for the standard attention.
+            # A similar change would be needed for MistralFlashAttention_KIVI if it's used.
+            else MistralFlashAttention_KIVI(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
         )
         self.mlp = MistralMLP(config)
         self.input_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -787,13 +800,29 @@ class MistralModel_KIVI(MistralPreTrainedModel):
         config: MistralConfig
     """
 
-    def __init__(self, config: MistralConfig):
+    def __init__(self, config: MistralConfig, layer_quant_map: Optional[Dict[int, Dict[str, int]]] = None):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([MistralDecoderLayer_KIVI(config) for _ in range(config.num_hidden_layers)])
+
+        # KVTuner: Modify layer creation to pass layer-specific quantization bits.
+        self.layers = nn.ModuleList()
+        for layer_idx in range(config.num_hidden_layers):
+            # Determine the nbits for this specific layer.
+            if layer_quant_map and layer_idx in layer_quant_map:
+                # Use the specific bits from the map if available.
+                nbits_key = layer_quant_map[layer_idx]['nbits_key']
+                nbits_value = layer_quant_map[layer_idx]['nbits_value']
+            else:
+                # Fallback to global config values if no layer-specific config is found.
+                nbits_key = config.k_bits
+                nbits_value = config.v_bits
+            
+            # Pass the specific nbits to the decoder layer constructor.
+            self.layers.append(MistralDecoderLayer_KIVI(config, nbits_key=nbits_key, nbits_value=nbits_value))
+
         self.norm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
@@ -951,9 +980,14 @@ class MistralModel_KIVI(MistralPreTrainedModel):
 class MistralForCausalLM_KIVI(MistralPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    # KVTuner: Modify the constructor to accept **kwargs and pass the map down.
+    def __init__(self, config, **kwargs):
         super().__init__(config)
-        self.model = MistralModel_KIVI(config)
+        # KVTuner: Pop the layer_quant_map from kwargs to pass it to the core model.
+        # This allows the argument to be passed through from_pretrained().
+        layer_quant_map = kwargs.pop("layer_quant_map", None)
+        self.model = MistralModel_KIVI(config, layer_quant_map=layer_quant_map)
+        
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

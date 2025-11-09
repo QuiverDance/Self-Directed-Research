@@ -6,8 +6,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import json
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import transformers
 
@@ -24,6 +25,11 @@ class ModelArguments:
     v_bits: Optional[int] = field(
         default=2,
         metadata={"help": "KV_cache quantization bits."},
+    )
+    # KVTuner: Add an argument to accept the layer-wise configuration file path.
+    layer_quant_config_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the KVTuner layer-wise quantization config JSON file."},
     )
     k_quant_dim: Optional[str] = field(
         default='token',
@@ -129,6 +135,61 @@ class TrainingArguments(transformers.TrainingArguments):
     qat: Optional[bool] = field(default=False)
     exp_name: Optional[str] = field(default="test")
 
+# KVTuner: Add a new function to parse the layer-wise quantization config file.
+def load_and_process_kvtuner_config(config_path: str) -> tuple[any, any]:
+    """
+    Loads and processes a KVTuner-style layer-wise quantization configuration file.
+
+    This function reads a JSON config.
+    - If "enable" is true, it creates a layer-to-bits map and returns it with the group choices.
+    - If "enable" is false, it returns a special marker "disabled".
+    - If the file doesn't exist, it returns (None, None).
+
+    Args:
+        config_path: The file path to the JSON configuration.
+
+    Returns:
+        A tuple containing:
+        - The processed configuration (a dict map, the string "disabled", or None).
+        - The list of group choices if applicable, otherwise None.
+    """
+    if not config_path or not os.path.exists(config_path):
+        return None, None
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    # Check if the layer-wise quantization is enabled in the config.
+    if not config.get("enable", False):
+        print("[KVTuner] Layer-wise quantization is DISABLED in the config file. Model will run in native FP16 mode.")
+        return "disabled", None
+
+    # --- Parse the configuration ---
+    quant_scheme = config["quant_scheme"]
+    candidates_map = config["candidates_index_map"]
+    
+    layer_groups = config["groups"][quant_scheme]
+    group_choices = config["group_choice"][quant_scheme]
+
+    if len(layer_groups) != len(group_choices):
+        raise ValueError(
+            f"Mismatch between the number of layer groups ({len(layer_groups)}) "
+            f"and group choices ({len(group_choices)}) in config file: {config_path}"
+        )
+
+    # --- Create the final layer-to-bits mapping ---
+    layer_to_bits_map = {}
+    for group_of_layers, choice_index in zip(layer_groups, group_choices):
+        candidate_key = str(choice_index)
+        if candidate_key not in candidates_map:
+            raise KeyError(f"Candidate index '{candidate_key}' not found in candidates_index_map in {config_path}.")
+        
+        bits_config = candidates_map[candidate_key]
+        for layer_index in group_of_layers:
+            layer_to_bits_map[layer_index] = bits_config.copy()
+    
+    print(f"[KVTuner] Loaded and processed layer-wise quantization config from: {config_path}")
+    return layer_to_bits_map, group_choices
 
 def process_args():
     parser = transformers.HfArgumentParser(
