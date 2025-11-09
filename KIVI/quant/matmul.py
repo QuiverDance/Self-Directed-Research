@@ -183,7 +183,7 @@ def cuda_bmm_fA_qB_outer(group_size: int,
 				bits: int) -> torch.FloatTensor:
 	"""
 	Compute the matrix multiplication C = query x key.
-	Where key is quantized into 2-bit values.
+	Where key is quantized into 2, 4, or 8-bit values. # KVTuner: Updated docstring
 
 	fA is of shape (B, nh, M, K) float16
 	qB is of shape (B, nh, K, N // feat_per_int) int32
@@ -212,7 +212,9 @@ def cuda_bmm_fA_qB_outer(group_size: int,
 	flatten_B = B * nh_kv
 	scales = scales.view(flatten_B, scales.shape[-2], scales.shape[-1]).transpose(1, 2).contiguous()
 	zeros = zeros.view(flatten_B, zeros.shape[-2], zeros.shape[-1]).transpose(1, 2).contiguous()
-	assert bits in [2, 4]
+    
+    # KVTuner: Allow 8-bit quantization by updating the assertion.
+	assert bits in [2, 4, 8]
 	assert nh % nh_kv == 0
 	c = kivi_gemv.gemv_forward_cuda_outer_dim(fA, qB, scales, zeros, bits, group_size, nh, nh_kv)
 	c = c.view(B, nh, c.shape[-2], c.shape[-1])
