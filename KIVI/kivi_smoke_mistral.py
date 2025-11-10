@@ -1,4 +1,4 @@
-# benchmark_kivi.py
+# kivi_smoke_mistral.py
 # A benchmark script for KIVI (Mistral-7B) to measure key performance metrics.
 # - Measures Runtime, Time-To-First-Token (TTFT), Throughput (Tokens/s), and Peak Inference Memory Footprint.
 # - Runs a fixed set of 3 diverse prompts.
