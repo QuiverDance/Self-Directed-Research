@@ -455,14 +455,59 @@ def run_humaneval(model, tokenizer, cfg):
 
     # Strip code fences like ```python ... ```
     def _strip_code_fences(s: str) -> str:
-        if s is None: return ""
+        """Remove leading/trailing Markdown code fences."""
+        if s is None:
+            return ""
         out = _re.sub(r"^\s*```(?:python)?\s*", "", s, flags=_re.IGNORECASE)
         out = _re.sub(r"\s*```\s*$", "", out)
         return out
 
+    def _sanitize_humaneval_completion(text: str, entry_point: str) -> str:
+        """
+        Make the completion executable by:
+          1) removing code fences,
+          2) commenting out natural-language lines before/after code,
+          3) ensuring the file starts from code (so imports/helpers are kept).
+        This mirrors the behavior that tends to happen implicitly in vLLM path.
+        """
+        import re
+        t = _strip_code_fences(text or "")
+        lines = t.splitlines()
+
+        code_starts = ("def ", "class ", "import ", "from ", "@")
+        started = False
+        out_lines = []
+        for ln in lines:
+            s = ln.lstrip()
+            # Start of "code-like" content
+            if not started and any(s.startswith(k) for k in code_starts):
+                started = True
+                out_lines.append(ln)
+                continue
+            if not started:
+                # Comment out preambles like "Here is the function..."
+                out_lines.append("# " + ln if ln.strip() else "")
+            else:
+                # After code begins, comment out plain-language paragraphs that appear at column 0
+                if (not ln.startswith((" ", "\t"))) and not any(s.startswith(k) for k in code_starts) \
+                   and s and not s.startswith(("#", "'''", '"""')):
+                    out_lines.append("# " + ln)
+                else:
+                    out_lines.append(ln)
+
+        body = "\n".join(out_lines).strip()
+        # If the declared entry_point exists in body, keep as-is; otherwise try to trim from the function start.
+        if f"def {entry_point}" in body:
+            return body
+        m = re.search(rf"def\s+{re.escape(entry_point)}\s*\(", t)
+        if m:
+            return t[m.start():].strip()
+        return body
+
     passed = 0
     for task, comp in zip(tasks, outputs):
-        program = f"{task['prompt']}{_strip_code_fences(comp)}\n\n{task['test']}"
+        body = _sanitize_humaneval_completion(comp, task['entry_point'])
+        program = "# -*- coding: utf-8 -*-\n" + f"{task['prompt']}{body}\n\n{task['test']}"
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(program); path = f.name
         try:
