@@ -356,6 +356,8 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
     def __init__(self, config: MistralConfig, nbits_key: int, nbits_value: int):
         # Call the parent's __init__ method.
         # super() will call MistralAttention_KIVI.__init__ which already contains our logic.
+        print("Init Flash Attention")
+
         super().__init__(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
 
     def forward(
@@ -717,13 +719,10 @@ class MistralDecoderLayer_KIVI(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         # KVTuner: Pass the layer-specific nbits to the attention module.
-        self.self_attn = (
-            MistralAttention_KIVI(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
-            if not getattr(config, "use_flash", False)
-            # Note: For simplicity, this example only shows the modification for the standard attention.
-            # A similar change would be needed for MistralFlashAttention_KIVI if it's used.
-            else MistralFlashAttention_KIVI(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
-        )
+        if not getattr(config, "use_flash", False):
+            self.self_attn = MistralAttention_KIVI(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
+        else:
+            self.self_attn = MistralFlashAttention_KIVI(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
         self.mlp = MistralMLP(config)
         self.input_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
