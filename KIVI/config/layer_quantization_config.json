@@ -1,5 +1,5 @@
 {
-  "enable": true,
+  "enable": false,
 
   "quant_scheme": "per-token-asym",
   "asymmetric": true,

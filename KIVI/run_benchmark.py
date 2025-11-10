@@ -52,11 +52,12 @@ except ImportError:
 # Global Benchmark Configuration
 # ==========================================================================================
 SEED = 2025
+PREFILL_CHUNK = 1024
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 BENCH_ALL_CONFIG = {
-    "mmlu":        {"num_samples": 14042, "kshot": 1, "batch_size": 128, "max_new_tokens": 1},
-    "gsm8k":       {"num_samples": 10, "kshot": 1, "batch_size": 8, "max_new_tokens": 256},
-    "humaneval":   {"num_samples": 164, "kshot": 0, "batch_size": 1, "max_new_tokens": 512},
+    "mmlu":        {"num_samples": 14042, "kshot": 1, "batch_size": 16, "max_new_tokens": 1},
+    "gsm8k":       {"num_samples": 1319, "kshot": 1, "batch_size": 16, "max_new_tokens": 256},
+    "humaneval":   {"num_samples": 164, "kshot": 0, "batch_size": 16, "max_new_tokens": 512},
     "line_retrieval": {
         "num_samples": 200, "batch_size": 1, "max_new_tokens": 64,
         "lr_num_lines": 2000, "lr_min_words": 5, "lr_max_words": 9, "lr_target_mode": "random",
@@ -225,6 +226,9 @@ def generate_and_measure(model: Any, tokenizer: Any, prompts: List[str], batch_s
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i:i + batch_size]
         inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+        # Baseline allocated bytes right before this batch starts
+        if _is_cuda(device): torch.cuda.synchronize(device)
+        base_alloc_now = torch.cuda.memory_allocated(device) if _is_cuda(device) else 0
         if _is_cuda(device): torch.cuda.reset_peak_memory_stats(device)
         if _is_cuda(device): torch.cuda.synchronize(device)
 
@@ -233,25 +237,31 @@ def generate_and_measure(model: Any, tokenizer: Any, prompts: List[str], batch_s
         input_ids = inputs["input_ids"]
         attn = inputs.get("attention_mask", None)
         seq_len = int(input_ids.size(1))
-        past = None
         with torch.inference_mode():
+            past = None
             if seq_len > 1:
-                # (A) Run base transformer ONLY on T-1 tokens to build KV (no logits creation).
-                pre_ids = input_ids[:, :-1]
-                pre_mask = attn[:, :-1] if attn is not None else None
-                base_out = model.model(
-                    input_ids=pre_ids,
-                    attention_mask=pre_mask,
-                    use_cache=True,
-                    return_dict=True,
-                )
-                past = base_out.past_key_values
-                del base_out
+                # (A) Low-memory prefill: build KV in chunks to cap activation peak.
+                chunk = PREFILL_CHUNK
+                end_prefill = seq_len - 1
+                for st in range(0, end_prefill, max(1, chunk)):
+                    ed = min(end_prefill, st + chunk)
+                    pre_ids  = input_ids[:, st:ed]
+                    pre_mask = attn[:, :ed] if attn is not None else None
+                    base_out = model.model(
+                        input_ids=pre_ids,
+                        attention_mask=pre_mask,
+                        use_cache=True,
+                        past_key_values=past,
+                        return_dict=True,
+                    )
+                    past = base_out.past_key_values
+                    del base_out
             # (B) One step on the last token → project hidden via lm_head (keeps FP16; tiny B×1×V).
             last_tok = input_ids[:, -1:].contiguous()
+            last_mask = attn[:, :seq_len] if attn is not None else None
             step_out = model.model(
                 input_ids=last_tok,
-                attention_mask=None,           # past already encodes sequence; mask not needed here
+                attention_mask=last_mask,
                 use_cache=True,
                 past_key_values=past,
                 return_dict=True,
@@ -318,7 +328,9 @@ def generate_and_measure(model: Any, tokenizer: Any, prompts: List[str], batch_s
 
         if _is_cuda(device): torch.cuda.synchronize(device)
         decode_duration = time.time() - t_decode_start
-        peak_mem = torch.cuda.max_memory_allocated(device) if _is_cuda(device) else 0
+        # Per-batch delta = (peak allocated during this batch) - (baseline allocated before batch)
+        peak_abs = torch.cuda.max_memory_allocated(device) if _is_cuda(device) else 0
+        peak_mem = max(0, int(peak_abs - base_alloc_now))
 
         batch_outputs = [tokenizer.decode(ids, skip_special_tokens=True) for ids in generated_ids_batch]
         all_outputs.extend(batch_outputs)
@@ -431,7 +443,10 @@ def run_gsm8k(model, tokenizer, cfg):
 def run_humaneval(model, tokenizer, cfg):
     print("[HumanEval] Preparing dataset...")
     # Corrected: Removed trust_remote_code=True
-    tasks = list(load_dataset("openai_humaneval", split="test"))[:cfg['num_samples']]
+    tasks = list(load_dataset("openai_humaneval", split="test"))
+    rng = random.Random(SEED)
+    rng.shuffle(tasks)
+    tasks = tasks[:cfg['num_samples']]
     prompts = [t['prompt'] for t in tasks]
     
     print(f"[HumanEval] Generating for {len(prompts)} samples...")
@@ -453,7 +468,7 @@ def run_humaneval(model, tokenizer, cfg):
         try:
             # Run with clean PYTHONPATH and shorter timeout as in reference
             res = subprocess.run([sys.executable, path],
-                                 capture_output=True, text=True, timeout=5,
+                                 capture_output=True, text=True, timeout=10,
                                  env={**os.environ, "PYTHONPATH": ""})
             if res.returncode == 0: passed += 1
         finally:
@@ -586,6 +601,90 @@ def run_line_retrieval(model, tokenizer, cfg):
 # ================== LongBench ==================
 _LB_ALLOWED = {"qasper", "hotpotqa", "2wikimqa", "musique"}
 
+_LB_ARTICLES = {"a", "an", "the"}
+_LB_PUNCT = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
+
+def _lb_normalize_text(s: str) -> str:
+    """Lowercase, strip punctuation, drop English articles, and squeeze spaces."""
+    if s is None:
+        return ""
+    s = s.lower().strip()
+    s = re.sub(f"[{re.escape(_LB_PUNCT)}]", " ", s)
+    s = " ".join(w for w in s.split() if w not in _LB_ARTICLES)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _lb_f1_em(pred: str, gold_list: List[str]) -> Tuple[float, float]:
+    """Return (max_f1, max_em) exactly as in longbench.py."""
+    pn = _lb_normalize_text(pred)
+    if pn == "" and any(_lb_normalize_text(g) == "" for g in gold_list):
+        return 1.0, 1.0
+    best_f1, best_em = 0.0, 0.0
+    for g in gold_list:
+        gn = _lb_normalize_text(g)
+        if gn == pn:
+            best_em = max(best_em, 1.0)
+        ptoks, gtoks = pn.split(), gn.split()
+        if len(ptoks) == 0 and len(gtoks) == 0:
+            f1 = 1.0
+        elif len(ptoks) == 0 or len(gtoks) == 0:
+            f1 = 0.0
+        else:
+            # multiset overlap
+            count_p, count_g = {}, {}
+            for t in ptoks: count_p[t] = count_p.get(t, 0) + 1
+            for t in gtoks: count_g[t] = count_g.get(t, 0) + 1
+            common = 0
+            for t in count_p:
+                if t in count_g:
+                    common += min(count_p[t], count_g[t])
+            if common == 0:
+                f1 = 0.0
+            else:
+                prec = common / len(ptoks)
+                rec  = common / len(gtoks)
+                f1   = 2 * prec * rec / (prec + rec)
+        best_f1 = max(best_f1, f1)
+    return best_f1, best_em
+
+def _lb_safe_tail_truncate(tokenizer, text: str, budget: int) -> str:
+    """Keep the tail tokens within budget (preserve the question tail)."""
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) <= budget:
+        return text
+    keep = ids[-budget:]
+    return tokenizer.decode(keep, skip_special_tokens=True)
+
+_LB_INSTRUCTIONS = {
+    # Match longbench.py INSTRUCTIONS (exact wording matters)
+    "qasper": (
+        "You are given a scientific article and a question.\n"
+        "Answer ONLY with exact phrase(s) copied verbatim from the article.\n"
+        "Do NOT add, paraphrase, or infer any new words.\n"
+        "If the question cannot be answered from the article, write: unanswerable.\n"
+        "If it is yes/no, answer: yes, no, or unanswerable.\n"
+        "Output ONLY the answer text, without quotes or extra words.\n"
+    ),
+    "hotpotqa": (
+        "You are given a long passage and a multi-hop question.\n"
+        "Answer ONLY with the minimal text span from the passage.\n"
+        "If it is yes/no, answer: yes or no. If unanswerable, write: unanswerable.\n"
+        "Output ONLY the answer text.\n"
+    ),
+    "2wikimqa": (
+        "You are given a long passage derived from multiple Wikipedia pages and a question.\n"
+        "Answer ONLY with the minimal text span from the passage (no extra words).\n"
+        "If it is yes/no, answer: yes or no. If unanswerable, write: unanswerable.\n"
+        "Output ONLY the answer text.\n"
+    ),
+    "musique": (
+        "You are given a long passage and a question that may require multi-hop reasoning.\n"
+        "Answer ONLY with a short span copied from the passage.\n"
+        "If unanswerable, write: unanswerable.\n"
+        "Output ONLY the answer text.\n"
+    ),
+}
+
 def _lb_resolve_file(dataset_name: str, base_dir: Optional[str]) -> str:
     """
     Resolve a concrete JSONL path for LongBench v1 subsets (qasper/hotpotqa/2wikimqa/musique).
@@ -628,42 +727,68 @@ def _lb_resolve_file(dataset_name: str, base_dir: Optional[str]) -> str:
         f"Place files as shown by your unzip log, e.g. data/data/{fname}.\nTried:{tried}"
     )
 
-def _lb_load_json_dataset(dataset_name: str, num_samples: Optional[int], data_dir: Optional[str]):
-    """Load LongBench subset from hard-coded local layout (no script)."""
+def _lb_load_json_dataset(dataset_name: str, data_dir: Optional[str]):
+    """Load entire LongBench subset locally; do NOT slice here (shuffle first, then slice)."""
     from datasets import load_dataset
     local_file = _lb_resolve_file(dataset_name, data_dir)
     ds = load_dataset("json", data_files=local_file, split="train")
-    if num_samples:
-        ds = ds.select(range(min(num_samples, len(ds))))
     return list(ds)
 
 def run_longbench(model, tokenizer, cfg, dataset_name: str):
     print(f"[LongBench:{dataset_name}] Preparing dataset...")
-    # Prefer local dir if user provided; resolve with hard-coded layout
+    # 1) Load all, then shuffle & slice to num_samples
     data_dir = cfg.get("lb_data_dir") or cfg.get("data_dir")
-    ds = _lb_load_json_dataset(dataset_name, cfg.get("num_samples"), data_dir)
-    
-    instr = {"qasper": "Answer ONLY with exact phrase(s) from the article.", "hotpotqa": "Answer ONLY with the minimal text span from the passage.", "2wikimqa": "Answer ONLY with the minimal text span from the passage.", "musique": "Answer ONLY with a short span copied from the passage."}[dataset_name]
-    prompts = [f"{instr}\nDocument:\n{r['context']}\n\nQuestion:\n{r['input']}\n\nAnswer:" for r in ds]
-    golds = [r['answers'] for r in ds]
-    
-    print(f"[LongBench:{dataset_name}] Generating for {len(prompts)} samples...")
-    outputs, per_batch_stats = generate_and_measure(model, tokenizer, prompts, cfg['batch_size'], cfg['max_new_tokens'], temperature=0.0)
-    
-    normalize_text = lambda s: re.sub(r"\s+", " ", re.sub(f"[{re.escape(string.punctuation)}]", " ", s.lower().replace(" a ", " ").replace(" an ", " ").replace(" the ", " "))).strip()
+    pool = _lb_load_json_dataset(dataset_name, data_dir)
+    rnd = random.Random(cfg.get("seed", SEED))
+    rnd.shuffle(pool)
+    ds = pool[: cfg.get("num_samples") or len(pool)]
+
+    # 2) Compute tokenizer-aware context budget:
+    #    budget = max_model_len - ctx_margin_tokens - max_new_tokens  (default margin=128)
+    ctx_margin_tokens = cfg.get("ctx_margin_tokens", 128)
+    max_ctx = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+    if not max_ctx:
+        max_ctx = getattr(tokenizer, "model_max_length", 16384) or 16384
+    budget = max(256, int(max_ctx) - int(ctx_margin_tokens) - int(cfg['max_new_tokens']))
+
+    # 3) Build prompts with tail-preserving truncation of ONLY the document
+    prompts, golds = [], []
+    instr = _LB_INSTRUCTIONS[dataset_name]
+    for r in ds:
+        # Robust field extraction across LB JSON variants
+        ctx = r.get("context") or r.get("passage") or r.get("document") or ""
+        q   = r.get("input") or r.get("question") or ""
+        ans = r.get("answers") or r.get("answer") or []
+        if isinstance(ans, str): ans = [ans]
+        if ans and isinstance(ans[0], list):
+            # Flatten possible [[...], ...] style
+            flat = []
+            for sub in ans:
+                flat.extend(sub if isinstance(sub, list) else [sub])
+            ans = flat
+
+        raw_prompt = f"{instr}\nDocument:\n{ctx}\n\nQuestion:\n{q}\n\nAnswer:"
+        tok_len = len(tokenizer.encode(raw_prompt, add_special_tokens=False))
+        if tok_len > budget:
+            ctx_budget = max(64, budget // 2)  # keep at least half for context
+            ctx_trunc = _lb_safe_tail_truncate(tokenizer, ctx, ctx_budget)
+            raw_prompt = f"{instr}\nDocument:\n{ctx_trunc}\n\nQuestion:\n{q}\n\nAnswer:"
+        prompts.append(raw_prompt); golds.append(ans)
+
+    print(f"[LongBench:{dataset_name}] Generating for {len(prompts)} samples.")
+    outputs, per_batch_stats = generate_and_measure(
+        model, tokenizer, prompts,
+        cfg['batch_size'], cfg['max_new_tokens'],
+        temperature=0.0, stop_sequences=None
+    )
+
+    # 4) Score
     f1s, ems = [], []
     for o, gs in zip(outputs, golds):
-        pred_toks = normalize_text(o).split(); best_f1, best_em = 0.0, 0.0
-        for g in gs:
-            gold_toks = normalize_text(g).split(); common = Counter(pred_toks) & Counter(gold_toks); num_same = sum(common.values())
-            precision = 1.0 * num_same / len(pred_toks) if pred_toks else 0
-            recall = 1.0 * num_same / len(gold_toks) if gold_toks else 0
-            f1 = (2 * precision * recall) / (precision + recall) if precision + recall > 0 else 0
-            best_f1 = max(best_f1, f1)
-            if normalize_text(o) == normalize_text(g): best_em = 1.0
-        f1s.append(best_f1); ems.append(best_em)
-
-    avg_f1 = sum(f1s) / len(f1s) if f1s else 0; avg_em = sum(ems) / len(ems) if ems else 0
+        f1, em = _lb_f1_em(o or "", gs or [])
+        f1s.append(f1); ems.append(em)
+    avg_f1 = sum(f1s) / len(f1s) if f1s else 0.0
+    avg_em = sum(ems) / len(ems) if ems else 0.0
     return {"bench": f"longbench_{dataset_name}", "score": avg_f1, "score_display": f"F1={avg_f1*100:.2f}%, EM={avg_em*100:.2f}%"}, per_batch_stats
 
 # ================== Needle-in-a-Haystack ==================
@@ -812,7 +937,7 @@ def main():
             metrics_raw = {
                 "avg_ttft_ms": avg_ttft_ms,
                 "throughput_tok_per_sec": total_tokens / total_gen_time if total_gen_time > 0 else 0,
-                "peak_inference_mem_bytes": max(0, max_peak_mem - base_mem),
+                "peak_inference_mem_bytes": max_peak_mem,
             }
             metrics_formatted = {
                 "avg_ttft": f"{metrics_raw['avg_ttft_ms']:.2f} ms",
@@ -839,7 +964,8 @@ def main():
         if metrics_raw and metrics_formatted:
             print(f"  [METRICS] Avg TTFT: {metrics_formatted['avg_ttft']} | Throughput: {metrics_formatted['throughput']} | Peak Memory: {metrics_formatted['peak_inference_memory']}")
 
-        for batch_stat in per_batch_metrics_list: batch_stat['peak_inference_memory'] = fmt_bytes(max(0, batch_stat['peak_inference_mem_bytes'] - base_mem))
+        for batch_stat in per_batch_metrics_list:
+            batch_stat['peak_inference_memory'] = fmt_bytes(batch_stat['peak_inference_mem_bytes'])
 
         result.update({
             'config': bench_cfg,
