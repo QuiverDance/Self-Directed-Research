@@ -350,50 +350,67 @@ class MistralAttention_KIVI(nn.Module):
                             value_states_full_repeat = torch.cat([value_states_full_repeat, pad], dim=2).contiguous()
                     attn_output += torch.matmul(attn_weights[:, :, :, -k_full_length:], value_states_full_repeat)
 
-            # --- V rolling (prefill / cache-path #1): D is 128 so group_size divides; any overflow is fine ---
+            # --- V rolling uses multiple-of-group_size, same as K ---
             _v_overflow = value_states_full.shape[-2] - self.residual_length
             value_states_quant_new = None
             scale = None
             mn = None
             if _v_overflow > 0:
-                v_to_quant = value_states_full[:, :, :_v_overflow, :].contiguous()
-                value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(
-                    v_to_quant, self.group_size, self.v_bits)
-                value_states_full = value_states_full[:, :, _v_overflow:, :].contiguous()
+                vq = (_v_overflow // self.group_size) * self.group_size
+                if vq > 0:
+                    v_to_quant = value_states_full[:, :, :vq, :].contiguous()
+                    value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(
+                        v_to_quant, self.group_size, self.v_bits
+                    )
+                    value_states_full = value_states_full[:, :, vq:, :].contiguous()
             value_states_quant = _safe_cat_dim(value_states_quant, value_states_quant_new, dim=2)
             value_scale        = _safe_cat_dim(value_scale,        scale,                  dim=2)
             value_mn           = _safe_cat_dim(value_mn,           mn,                     dim=2)
         else:
 
-            # quantize
-            if key_states.shape[-2] % self.residual_length != 0:
-                if key_states.shape[-2] < self.residual_length:
-                    key_states_quant = None
-                    key_states_full = key_states
-                else:
-                    key_states_quant = key_states[:, :, :-(key_states.shape[-2] % self.residual_length), :].contiguous()
-                    key_states_full = key_states[:, :, -(key_states.shape[-2] % self.residual_length):, :].contiguous()
-            else:
-                key_states_quant = key_states
-                key_states_full = None
-            if key_states_quant is not None:
-                key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(key_states_quant.transpose(2, 3).contiguous(), self.group_size, self.k_bits)
-            else:
+            # --- K initial quantization uses the same boundary policy as rolling ---
+            k_total = key_states.shape[-2]
+            k_over  = k_total - self.residual_length
+            if k_over <= 0:
                 key_states_quant_trans = None
                 key_scale_trans = None
                 key_mn_trans = None
+                key_states_full = key_states
+            else:
+                kq = (k_over // self.group_size) * self.group_size  # quantizable tokens
+                if kq > 0:
+                    k_src = key_states[:, :, :kq, :].transpose(2, 3).contiguous()
+                    key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(
+                        k_src, self.group_size, self.k_bits
+                    )
+                    key_states_full = key_states[:, :, kq:, :].contiguous()  # remainder + residual
+                else:
+                    key_states_quant_trans = None
+                    key_scale_trans = None
+                    key_mn_trans = None
+                    key_states_full = key_states
             
-            if value_states.shape[-2] <= self.residual_length:
+            # --- V initial quantization aligned with K (multiple-of-group_size only) ---
+            v_total = value_states.shape[-2]
+            v_over  = v_total - self.residual_length
+            if v_over <= 0:
                 value_states_quant = None
-                value_states_full = value_states
                 value_scale = None
                 value_mn = None
+                value_states_full = value_states
             else:
-                value_states_quant = value_states[:, :, :-self.residual_length, :].contiguous()
-                value_states_full = value_states[:, :, -self.residual_length:, :].contiguous()
-                value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(value_states_quant, 
-                                                                                                self.group_size, 
-                                                                                                self.v_bits)
+                vq = (v_over // self.group_size) * self.group_size
+                if vq > 0:
+                    v_src = value_states[:, :, :vq, :].contiguous()
+                    value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(
+                        v_src, self.group_size, self.v_bits
+                    )
+                    value_states_full = value_states[:, :, vq:, :].contiguous()  # remainder + residual
+                else:
+                    value_states_quant = None
+                    value_scale = None
+                    value_mn = None
+                    value_states_full = value_states
         
             key_states   = _repeat_to_match_heads(key_states,   query_states.shape[1])
             value_states = _repeat_to_match_heads(value_states, query_states.shape[1])
@@ -641,16 +658,19 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                     attn_output += torch.matmul(attn_weights[:, :, :, -k_full_length:], value_states_full_repeat)
             attn_output = attn_output.transpose(1, 2).contiguous()
 
-            # --- V rolling (prefill / cache-path #2): same as above ---
+            # --- V rolling (FA path) uses multiple-of-group_size, same as K ---
             value_states_quant_new = None
             scale = None
             mn = None
             _v_overflow = value_full_length - self.residual_length
             if _v_overflow > 0:
-                v_to_quant = value_states_full[:, :, :_v_overflow, :].contiguous()
-                value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(
-                    v_to_quant, self.group_size, self.v_bits)
-                value_states_full = value_states_full[:, :, _v_overflow:, :].contiguous()
+                vq = (_v_overflow // self.group_size) * self.group_size
+                if vq > 0:
+                    v_to_quant = value_states_full[:, :, :vq, :].contiguous()
+                    value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(
+                        v_to_quant, self.group_size, self.v_bits
+                    )
+                    value_states_full = value_states_full[:, :, vq:, :].contiguous()
             value_states_quant = _safe_cat_dim(value_states_quant, value_states_quant_new, dim=2)
             value_scale        = _safe_cat_dim(value_scale,        scale,                  dim=2)
             value_mn           = _safe_cat_dim(value_mn,           mn,                     dim=2)
@@ -683,35 +703,50 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 query_states.transpose(1, 2), key_states_repeat.transpose(1, 2), 
                 value_states_repeat.transpose(1, 2), None, q_len, dropout=0.0
             )
-            # quantize
-            if key_states.shape[-2] % self.residual_length != 0:
-                if key_states.shape[-2] < self.residual_length:
-                    key_states_quant = None
-                    key_states_full = key_states
-                else:
-                    key_states_quant = key_states[:, :, :-(key_states.shape[-2] % self.residual_length), :].contiguous()
-                    key_states_full = key_states[:, :, -(key_states.shape[-2] % self.residual_length):, :].contiguous()
-            else:
-                key_states_quant = key_states
-                key_states_full = None
-            if key_states_quant is not None:
-                key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(key_states_quant.transpose(2, 3).contiguous(), self.group_size, self.k_bits)
-            else:
+
+            # --- K initial quantization (FA path) ---
+            k_total = key_states.shape[-2]
+            k_over  = k_total - self.residual_length
+            if k_over <= 0:
                 key_states_quant_trans = None
                 key_scale_trans = None
                 key_mn_trans = None
+                key_states_full = key_states
+            else:
+                kq = (k_over // self.group_size) * self.group_size
+                if kq > 0:
+                    k_src = key_states[:, :, :kq, :].transpose(2, 3).contiguous()
+                    key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(
+                        k_src, self.group_size, self.k_bits
+                    )
+                    key_states_full = key_states[:, :, kq:, :].contiguous()
+                else:
+                    key_states_quant_trans = None
+                    key_scale_trans = None
+                    key_mn_trans = None
+                    key_states_full = key_states
             
-            if value_states.shape[-2] <= self.residual_length:
+            # --- V initial quantization (FA path) ---
+            v_total = value_states.shape[-2]
+            v_over  = v_total - self.residual_length
+            if v_over <= 0:
                 value_states_quant = None
-                value_states_full = value_states
                 value_scale = None
                 value_mn = None
+                value_states_full = value_states
             else:
-                value_states_quant = value_states[:, :, :-self.residual_length, :].contiguous()
-                value_states_full = value_states[:, :, -self.residual_length:, :].contiguous()
-                value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(value_states_quant, 
-                                                                                                self.group_size, 
-                                                                                                self.v_bits)
+                vq = (v_over // self.group_size) * self.group_size
+                if vq > 0:
+                    v_src = value_states[:, :, :vq, :].contiguous()
+                    value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(
+                        v_src, self.group_size, self.v_bits
+                    )
+                    value_states_full = value_states[:, :, vq:, :].contiguous()
+                else:
+                    value_states_quant = None
+                    value_scale = None
+                    value_mn = None
+                    value_states_full = value_states
             
         past_key_value = (key_states_quant_trans, key_states_full, key_scale_trans, key_mn_trans, 
                           value_states_quant, value_states_full, value_scale, value_mn, kv_seq_len) if use_cache else None
