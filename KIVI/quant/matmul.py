@@ -133,7 +133,7 @@ def triton_bmm_fA_qB_outer(group_size: int,
 	B, nh, M, K = fA.shape 
 	feat_per_int = 32 // bits
 	# flatten to a 3D tensor
-	fA = fA.view(-1, M, K)
+	fA = fA.reshape(-1, M, K)
 	N = qB.shape[-1] * feat_per_int
 	qB = qB.reshape(-1, K, qB.shape[-1])
 	# This is based on the possible BLOCK_SIZE_Ks
@@ -148,8 +148,8 @@ def triton_bmm_fA_qB_outer(group_size: int,
 	grid = lambda META: (
 		flatten_B, triton.cdiv(N, META['BLOCK_SIZE_N']),
 	)
-	scales = scales.view(flatten_B, scales.shape[-2], scales.shape[-1])
-	zeros = zeros.view(flatten_B, zeros.shape[-2], zeros.shape[-1])
+	scales = scales.reshape(flatten_B, scales.shape[-2], scales.shape[-1])
+	zeros = zeros.reshape(flatten_B, zeros.shape[-2], zeros.shape[-1])
 	if N > K:
 		BLOCK_SIZE_N = 128	
 		BLOCK_SIZE_K = 32
@@ -172,7 +172,7 @@ def triton_bmm_fA_qB_outer(group_size: int,
 		group_size, BLOCK_SIZE_N, BLOCK_SIZE_K, 
 		num_warps=num_warps, num_stages=num_stages
 	)
-	return c.view(B, nh, c.shape[-2], c.shape[-1])
+	return c.reshape(B, nh, c.shape[-2], c.shape[-1])
 
 
 def cuda_bmm_fA_qB_outer(group_size: int, 
@@ -200,7 +200,7 @@ def cuda_bmm_fA_qB_outer(group_size: int,
 	nh_kv =  qB.shape[1]
 	feat_per_int = 32 // bits
 	# flatten to a 3D tensor
-	fA = fA.view(-1, M, K).contiguous()
+	fA = fA.reshape(-1, M, K).contiguous()
 	N = qB.shape[-1] * feat_per_int
 	qB = qB.reshape(-1, K, qB.shape[-1]).transpose(1, 2).contiguous()
 	# This is based on the possible BLOCK_SIZE_Ks
@@ -210,12 +210,12 @@ def cuda_bmm_fA_qB_outer(group_size: int,
 	# This is based on the possible BLOCK_SIZE_Ks
 	# assert group_size % 64 == 0, "groupsize must be a multiple of 64, and 128"
 	flatten_B = B * nh_kv
-	scales = scales.view(flatten_B, scales.shape[-2], scales.shape[-1]).transpose(1, 2).contiguous()
-	zeros = zeros.view(flatten_B, zeros.shape[-2], zeros.shape[-1]).transpose(1, 2).contiguous()
+	scales = scales.reshape(flatten_B, scales.shape[-2], scales.shape[-1]).transpose(1, 2).contiguous()
+	zeros = zeros.reshape(flatten_B, zeros.shape[-2], zeros.shape[-1]).transpose(1, 2).contiguous()
     
     # KVTuner: Allow 8-bit quantization by updating the assertion.
 	assert bits in [2, 4, 8]
 	assert nh % nh_kv == 0
 	c = kivi_gemv.gemv_forward_cuda_outer_dim(fA, qB, scales, zeros, bits, group_size, nh, nh_kv)
-	c = c.view(B, nh, c.shape[-2], c.shape[-1])
+	c = c.reshape(B, nh, c.shape[-2], c.shape[-1])
 	return c

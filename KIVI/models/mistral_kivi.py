@@ -188,7 +188,7 @@ class MistralAttention_KIVI(nn.Module):
                 key_states_quant_trans_repeat = repeat_kv_quant(key_states_quant_trans, self.num_key_value_groups)
                 key_scale_trans_repeat = repeat_kv_quant(key_scale_trans, self.num_key_value_groups)
                 key_mn_trans_repeat = repeat_kv_quant(key_mn_trans, self.num_key_value_groups)
-                att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans_repeat, 
+                att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states.contiguous(), key_states_quant_trans_repeat, 
                                 key_scale_trans_repeat, key_mn_trans_repeat, self.k_bits) # key_states_quant_trans, key_scale_trans, key_mn_trans need to be repeated
             else:
                 att_qkquant = None
@@ -247,7 +247,7 @@ class MistralAttention_KIVI(nn.Module):
                 value_states_quant_repeat = repeat_kv_quant(value_states_quant, self.num_key_value_groups)
                 value_scale_repeat = repeat_kv_quant(value_scale, self.num_key_value_groups)
                 value_mn_repeat = repeat_kv_quant(value_mn, self.num_key_value_groups)
-                attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant_repeat, 
+                attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length].contiguous(), value_states_quant_repeat, 
                                                 value_scale_repeat, value_mn_repeat, self.v_bits) # value_states_quant, value_scale, value_mn need to be repeated
                 
                 value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
@@ -425,7 +425,7 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 key_states_quant_trans_repeat = repeat_kv_quant(key_states_quant_trans, self.num_key_value_groups)
                 key_scale_trans_repeat = repeat_kv_quant(key_scale_trans, self.num_key_value_groups)
                 key_mn_trans_repeat = repeat_kv_quant(key_mn_trans, self.num_key_value_groups)
-                att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans_repeat, 
+                att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states.contiguous(), key_states_quant_trans_repeat, 
                                 key_scale_trans_repeat, key_mn_trans_repeat, self.k_bits) # key_states_quant_trans, key_scale_trans, key_mn_trans need to be repeated
             else:
                 att_qkquant = None
@@ -485,7 +485,7 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 value_states_quant_repeat = repeat_kv_quant(value_states_quant, self.num_key_value_groups)
                 value_scale_repeat = repeat_kv_quant(value_scale, self.num_key_value_groups)
                 value_mn_repeat = repeat_kv_quant(value_mn, self.num_key_value_groups)
-                attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant_repeat, 
+                attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length].contiguous(), value_states_quant_repeat, 
                                                 value_scale_repeat, value_mn_repeat, self.v_bits) # value_states_quant, value_scale, value_mn need to be repeated
                 
                 value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
