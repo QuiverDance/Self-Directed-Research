@@ -58,8 +58,9 @@ BENCH_ALL_CONFIG = {
     "gsm8k":       {"num_samples": 1319, "kshot": 1, "batch_size": 16, "max_new_tokens": 256},
     "humaneval":   {"num_samples": 164, "kshot": 0, "batch_size": 16, "max_new_tokens": 512},
     "line_retrieval": {
-        "num_samples": 200, "batch_size": 1, "max_new_tokens": 64,
+        "num_samples": 200, "batch_size": 2, "max_new_tokens": 64,
         "lr_num_lines": 1000, "lr_min_words": 5, "lr_max_words": 9, "lr_target_mode": "random",
+        "lr_max_prompt_tokens": 10000,  # hard cap for prompt tokens (problem text) regardless of longer model context
     },
     "longbench_qasper":  {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
     "longbench_hotpotqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
@@ -167,6 +168,7 @@ def load_kivi_model_and_tokenizer(args: argparse.Namespace) -> Tuple[Any, Any]:
         cfg.k_bits, cfg.v_bits = int(args.k_bits), int(args.v_bits)
         cfg.group_size, cfg.residual_length = int(args.group_size), int(args.residual_length)
         cfg.use_flash = bool(args.use_flash)
+        if cfg.use_flash: cfg._flash_attn_2_enabled = True
 
         if isinstance(layer_quant_map, dict):
             run_label = "[MODE] Quantized (KIVI) - Layer-wise"
@@ -538,48 +540,69 @@ _COMMON_WORDS_LR = [
     "like","him","into","time","has","look","two","more","write","go","see","number","no","way","could",
 ]
 
-def _lr_rand_word_random(rng, mi=3, ma=8):
-    n = rng.randint(mi, ma); return "".join(rng.choice(string.ascii_lowercase) for _ in range(n))
-
-def _lr_rand_word_common(rng):
-    return rng.choice(_COMMON_WORDS_LR)
-
-def _lr_make_corpus(num_lines, min_words, max_words, seed, vocab_mode):
-    """Build a corpus of 'num_lines' lines deterministically from seed."""
-    rng = random.Random(seed); lines = []
-    for _ in range(num_lines):
-        k = rng.randint(min_words, max_words)
-        words = ([_lr_rand_word_common(rng) for _ in range(k)]
-                 if vocab_mode == "common" else
-                 [_lr_rand_word_random(rng) for _ in range(k)])
-        lines.append(" ".join(words))
-    return lines
-
-def _lr_choose_target_index(num_lines, mode, rng):
-    if mode == "head":   return 1
-    if mode == "middle": return (num_lines + 1) // 2
-    if mode == "tail":   return num_lines
-    return rng.randint(1, num_lines)
-
-def _lr_build_prompt(lines, target_idx):
-    """Return (prompt, gold_text) with contiguous numbering 1..L."""
-    L = len(lines)
-    header = (
-        "You will be shown a list of numbered lines. "
-        f"There are {L} lines in total. "
-        f"Return EXACTLY the text of the line with number {target_idx}. "
-        "Do not include the line number or any extra words. "
-        "Output only the line text.\n\n"
-        "Numbered lines:\n"
+def lr_make_line(rng: random.Random, min_words: int, max_words: int) -> str:
+    """Generate one synthetic line with random 'words' of 3~8 letters."""
+    letters = string.ascii_lowercase
+    return " ".join(
+        ["".join(rng.choices(letters, k=rng.randint(3, 8)))
+         for _ in range(rng.randint(min_words, max_words))]
     )
-    body = "\n".join([f"Line {i+1}: {lines[i]}" for i in range(L)])
-    prompt = header + body + "\n\nAnswer:"
-    gold = lines[target_idx - 1]
-    return prompt, gold
 
-def _lr_count_tokens(tokenizer, text: str) -> int:
-    # vLLM-style: tokenizer.encode returns list of ids
-    return len(tokenizer.encode(text))
+def lr_choose_target_index(n: int, mode: str, rng: random.Random) -> int:
+    """Choose target line index (1-based) depending on sampling mode."""
+    if mode == "head":   return 1
+    if mode == "tail":   return n
+    if mode == "middle": return max(1, min(n, n // 2))
+    return rng.randint(1, n)
+
+def lr_count_tokens(tokenizer, text: str) -> int:
+    """Count tokens without adding special tokens."""
+    return len(tokenizer(text, add_special_tokens=False).input_ids)
+
+def _lr_fmt_block(lines: list[str], enumerate_ln: bool) -> str:
+    """Format lines into a display block, optionally enumerated (1-based)."""
+    if enumerate_ln:
+        return "\n".join(f"{i+1}: {s}" for i, s in enumerate(lines))
+    return "\n".join(lines)
+
+def lr_build_prompt(
+    lines: list[str], target_idx: int, *, enumerate_ln: bool,
+    answer_tag: str, fewshot_demo: int
+) -> str:
+    """Build instruction + (optional) 1-shot demo + body enclosed by markers."""
+    header = (
+        "You are given a list of lines between <BEGIN> and <END>.\n"
+        f"Return the exact content of line #{target_idx} verbatim.\n"
+        f"- Output MUST start with {answer_tag} and then ONLY the line content.\n"
+        "- Do NOT add quotes, prefixes, suffixes, or explanations.\n"
+    )
+    demo = ""
+    if fewshot_demo:
+        demo_lines = ["alpha beta", "gamma", "delta zeta"]
+        demo_target = 2
+        demo = (
+            "\nExample:\n<BEGIN>\n"
+            + _lr_fmt_block(demo_lines, enumerate_ln=True)
+            + "\n<END>\nAnswer:\n"
+            + f"{answer_tag} {demo_lines[demo_target-1]}\n\n"
+        )
+    body = "<BEGIN>\n" + _lr_fmt_block(lines, enumerate_ln) + "\n<END>\nAnswer:\n"
+    return header + demo + body
+
+def lr_normalize(s: str) -> str:
+    """Normalize whitespace for tolerant matching."""
+    return re.sub(r"\s+", " ", s.strip())
+
+def lr_extract_answer(text: str, answer_tag: str) -> str | None:
+    """Extract the model's answer after [ANS] tag, fallback to first line."""
+    if not text:
+        return None
+    idx = text.find(answer_tag)
+    if idx < 0:
+        first = text.splitlines()[0] if text else ""
+        return first.strip() or None
+    sub = text[idx + len(answer_tag):]
+    return sub.splitlines()[0].strip() if sub else None
 
 def run_line_retrieval(model, tokenizer, cfg):
     print("[LineRetrieval] Preparing dataset...")
@@ -593,34 +616,52 @@ def run_line_retrieval(model, tokenizer, cfg):
     target_mode  = cfg.get("lr_target_mode", "random") # "head"|"middle"|"tail"|"random"
     batch_size   = int(cfg.get("batch_size", 1))
     max_new_tok  = int(cfg.get("max_new_tokens", 64))
-    # Context budget: use model's max length minus a safety margin (no KV blowups).
-    ctx_margin_tokens = int(cfg.get("ctx_margin_tokens", 512))
-    model_max = getattr(getattr(model, "config", None), "max_position_embeddings", None)
-    if model_max is None:
-        model_max = 32768  # sensible default if not exposed
-    budget = max(256, model_max - ctx_margin_tokens)
+    answer_tag   = cfg.get("lr_answer_tag", "[ANS]")
+    enumerate_ln = bool(cfg.get("lr_enumerate_lines", True))
+    stop_on_nl   = bool(cfg.get("lr_stop_on_newline", True))
+    strict_exact = bool(cfg.get("lr_strict_exact", False))
+    fewshot_demo = int(cfg.get("lr_fewshot_demo", 1))
+
+    # === Token budget for the *prompt text only* ===
+    # We must (1) cap the constructed problem within 10k tokens,
+    # and (2) still respect the model's max context (minus a safety margin).
+    # Final prompt budget = min(lr_max_prompt_tokens, model_budget).
+    lr_max_prompt_tokens = int(cfg.get("lr_max_prompt_tokens", 10000))
+    ctx_margin_tokens = int(cfg.get("ctx_margin_tokens", 128))
+    model_max_ctx = getattr(getattr(model, "config", None), "max_position_embeddings", None) or 32768
+    model_budget  = max(256, int(model_max_ctx) - ctx_margin_tokens)
+    budget = max(256, min(lr_max_prompt_tokens, model_budget))
 
     # Build samples with budget enforcement
     samples = []
     for s in range(num_samples):
-        lines = _lr_make_corpus(num_lines, min_words, max_words, seed=SEED + s * 9973,
-                                vocab_mode=vocab_mode)
-        target_idx = _lr_choose_target_index(num_lines, target_mode, rng)
+        # Build full corpus & select target
+        lines = [lr_make_line(rng, min_words, max_words) for _ in range(num_lines)]
+        target_idx = lr_choose_target_index(num_lines, target_mode, rng)
+        gold = lines[target_idx - 1]
 
-        # Try full L; shrink if token budget exceeded
+        # Fit to token budget (cap to <= 10k and model limit)
         attempt, cur_num = 0, num_lines
-        prompt, gold = _lr_build_prompt(lines, target_idx)
-        tok_len = _lr_count_tokens(tokenizer, prompt)
-        while tok_len > budget and attempt < 4 and cur_num > 1:
+        prompt = lr_build_prompt(
+            lines, target_idx,
+            enumerate_ln=enumerate_ln, answer_tag=answer_tag, fewshot_demo=fewshot_demo
+        )
+        tok_len = lr_count_tokens(tokenizer, prompt)
+        while tok_len > budget and attempt < 12 and cur_num > 1:
             shrink_ratio = budget / float(tok_len)
             new_num = max(1, int(math.floor(cur_num * shrink_ratio * 0.95)))
             if new_num == cur_num:
                 new_num = max(1, cur_num - 1)
-            lines      = lines[:new_num]
-            target_idx = min(target_idx, new_num)
-            prompt, gold = _lr_build_prompt(lines, target_idx)
-            tok_len = _lr_count_tokens(tokenizer, prompt)
-            cur_num = new_num; attempt += 1
+            lines       = lines[:new_num]
+            target_idx  = min(target_idx, new_num)
+            gold        = lines[target_idx - 1]
+            prompt      = lr_build_prompt(
+                lines, target_idx,
+                enumerate_ln=enumerate_ln, answer_tag=answer_tag, fewshot_demo=fewshot_demo
+            )
+            tok_len     = lr_count_tokens(tokenizer, prompt)
+            cur_num     = new_num
+            attempt    += 1
 
         samples.append((prompt, gold))
 
@@ -628,17 +669,27 @@ def run_line_retrieval(model, tokenizer, cfg):
     golds   = [g for _, g in samples]
 
     print(f"[LineRetrieval] Generating for {len(prompts)} samples...")
-    # IMPORTANT: no hard stop at '\n' (can truncate to empty); rely on strip-EM below.
+    # Decode: stop at first newline to avoid extra text
+    stop_sequences = ["\n"] if stop_on_nl else None
+    max_new_tok = min(max_new_tok, max(8, max_words * 4))  # small line is enough
     outputs, per_batch_stats = generate_and_measure(
-        model, tokenizer, prompts,
-        batch_size, max_new_tok,
-        temperature=0.0, stop_sequences=None
+        model, tokenizer, prompts, batch_size, max_new_tok,
+        temperature=0.0, top_p=1.0, stop_sequences=stop_sequences
     )
 
-    # Score: exact line text after .strip()
+    # Post-process & score
     preds = [o.strip() for o in outputs]
-    correct = sum(1 for p, g in zip(preds, golds) if p.strip() == g.strip())
-    acc = correct / len(golds) if golds else 0.0
+    preds = []
+    for out in outputs:
+        ans = lr_extract_answer(out, answer_tag) or ""
+        preds.append(ans)
+    
+    correct = 0
+    for pred, gold in zip(preds, golds):
+       ok = (pred == gold) if strict_exact else (lr_normalize(pred) == lr_normalize(gold))
+       correct += int(ok)
+
+    acc = correct / max(1, len(golds))
     print(f"[LINE_RETRIEVAL] acc={acc*100:.2f}% ({correct}/{len(golds)})")
 
     return {"bench": "line_retrieval", "score": acc, "score_display": f"acc={acc*100:.2f}% ({correct}/{len(golds)})"}, per_batch_stats
@@ -837,6 +888,9 @@ def run_longbench(model, tokenizer, cfg, dataset_name: str):
     return {"bench": f"longbench_{dataset_name}", "score": avg_f1, "score_display": f"F1={avg_f1*100:.2f}%, EM={avg_em*100:.2f}%"}, per_batch_stats
 
 # ================== Needle-in-a-Haystack ==================
+def _nh_rand_word_common(rng):
+    return rng.choice(_COMMON_WORDS_LR)
+
 _NEEDLE_TOKEN_RE = re.compile(r"([A-Za-z0-9\-]{2,})")
 
 def _nh_normalize_value(s: str) -> str:
@@ -852,7 +906,6 @@ def _nh_extract_token(text: str) -> str:
 
 def run_needle(model, tokenizer, cfg):
     print("[Needle] Preparing dataset.")
-    rng = random.Random(SEED)
     num_samples = int(cfg.get('num_samples', 10))
     batch_size  = int(cfg.get('batch_size', 1))
     max_new_tok = int(cfg.get('max_new_tokens', 8))
@@ -868,9 +921,9 @@ def run_needle(model, tokenizer, cfg):
     def _make_tokens_to_budget(target_tokens: int, rng_i: random.Random) -> str:
         parts, sent_words = [], rng_i.randint(7, 14)
         while True:
-            words = ([_lr_rand_word_common(rng_i) for _ in range(sent_words)]
+            words = ([_nh_rand_word_common(rng_i) for _ in range(sent_words)]
                      if vocab_mode == "common" else
-                     [_lr_rand_word_random(rng_i) for _ in range(sent_words)])
+                     [_nh_rand_word_common(rng_i) for _ in range(sent_words)])
             parts.append(" ".join(words) + ". ")
             txt = "".join(parts)
             if len(tokenizer.encode(txt)) >= target_tokens:
