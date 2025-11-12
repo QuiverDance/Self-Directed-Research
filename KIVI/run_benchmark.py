@@ -56,7 +56,7 @@ DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 BENCH_ALL_CONFIG = {
     "mmlu":        {"num_samples": 14042, "kshot": 1, "batch_size": 16, "max_new_tokens": 1},
     "gsm8k":       {"num_samples": 1319, "kshot": 1, "batch_size": 16, "max_new_tokens": 256},
-    "humaneval":   {"num_samples": 164, "kshot": 0, "batch_size": 16, "max_new_tokens": 512},
+    "humaneval":   {"num_samples": 164, "batch_size": 16, "max_new_tokens": 512},
     "line_retrieval": {
         "num_samples": 200, "batch_size": 2, "max_new_tokens": 64,
         "lr_num_lines": 1000, "lr_min_words": 5, "lr_max_words": 9, "lr_target_mode": "random",
@@ -910,6 +910,14 @@ def run_longbench(model, tokenizer, cfg, dataset_name: str):
         max_ctx = getattr(tokenizer, "model_max_length", 16384) or 16384
     budget = max(256, int(max_ctx) - int(ctx_margin_tokens) - int(cfg['max_new_tokens']))
 
+    def _ctx_budget_for(sample_question: str, instr: str) -> int:
+        """Give almost all available tokens to the document by subtracting the non-doc overhead."""
+        overhead_ids = tokenizer.encode(
+            f"{instr}\nDocument:\n\n\nQuestion:\n{sample_question}\n\nAnswer:",
+            add_special_tokens=False
+        )
+        return max(64, budget - len(overhead_ids))
+
     # 3) Build prompts with tail-preserving truncation of ONLY the document
     prompts, golds = [], []
     instr = _LB_INSTRUCTIONS[dataset_name]
@@ -929,8 +937,9 @@ def run_longbench(model, tokenizer, cfg, dataset_name: str):
         raw_prompt = f"{instr}\nDocument:\n{ctx}\n\nQuestion:\n{q}\n\nAnswer:"
         tok_len = len(tokenizer.encode(raw_prompt, add_special_tokens=False))
         if tok_len > budget:
-            ctx_budget = max(64, budget // 2)  # keep at least half for context
-            ctx_trunc = _lb_safe_tail_truncate(tokenizer, ctx, ctx_budget)
+            # Dynamically compute how many tokens we can give to the document
+            ctx_budget = _ctx_budget_for(q, instr)
+            ctx_trunc  = _lb_safe_tail_truncate(tokenizer, ctx, ctx_budget)
             raw_prompt = f"{instr}\nDocument:\n{ctx_trunc}\n\nQuestion:\n{q}\n\nAnswer:"
         prompts.append(raw_prompt); golds.append(ans)
 
