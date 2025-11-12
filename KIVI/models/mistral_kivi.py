@@ -42,52 +42,6 @@ except Exception:
     def is_flash_attn_2_available():
         return False
 
-def _safe_cat_dim(base, chunk, dim: int):
-    """Safely concatenate along dim. If chunk is None -> return base;
-    if base is None -> return chunk; else cat([base, chunk], dim)."""
-    if chunk is None:
-        return base
-    if base is None:
-        return chunk
-    return torch.cat([base, chunk], dim=dim)
-
-def _align_kdim(qB, scale, zero, K_target: int):
-    """
-    Align (B, nh_kv, K, P) tensors to K_target along dim=2 by slice/pad.
-    Returns possibly new tensors with .contiguous().
-    """
-    if qB is None:   return None, None, None
-    K_src = qB.shape[2]
-    if K_src == K_target:
-        return qB.contiguous(), scale.contiguous(), zero.contiguous()
-    if K_src > K_target:
-        return (qB[:, :, :K_target, :].contiguous(),
-                scale[:, :, :K_target, :].contiguous(),
-                zero[:, :, :K_target, :].contiguous())
-    # pad (rare): pad with zeros; padded positions are masked by -inf logits
-    padK = K_target - K_src
-    pad_q = torch.zeros(qB.shape[0], qB.shape[1], padK, qB.shape[3], dtype=qB.dtype, device=qB.device)
-    pad_s = torch.zeros(scale.shape[0], scale.shape[1], padK, scale.shape[3], dtype=scale.dtype, device=scale.device)
-    pad_z = torch.zeros(zero.shape[0],  zero.shape[1],  padK, zero.shape[3],  dtype=zero.dtype,  device=zero.device)
-    return (torch.cat([qB,   pad_q], dim=2).contiguous(),
-            torch.cat([scale,pad_s], dim=2).contiguous(),
-            torch.cat([zero, pad_z], dim=2).contiguous())
-
-def _repeat_to_match_heads(t: torch.Tensor, target_heads: int) -> torch.Tensor:
-    """
-    Repeat kv heads along dim=1 to exactly match target_heads.
-    Works for both full and packed/quant tensors (shape starts with (B, H_kv, ...)).
-    If H_kv does not divide target_heads, we repeat ceil and slice.
-    """
-    B, H_kv = t.shape[0], t.shape[1]
-    if H_kv == target_heads:
-        return t
-    # minimal repeats to cover target_heads
-    n_rep = (target_heads + H_kv - 1) // H_kv
-    # expand then slice to exact target_heads
-    t = t[:, :, None, ...].expand(B, H_kv, n_rep, *t.shape[2:]).reshape(B, H_kv * n_rep, *t.shape[2:])
-    return t[:, :target_heads, ...]
-
 def _kivi_get_past_length(past):
     if past is None:
         return 0
@@ -100,12 +54,6 @@ def _kivi_get_past_length(past):
             return past.get_seq_length()
         except Exception:
             return 0
-
-def _kivi_has_nonempty_past(past):
-    try:
-        return _kivi_get_past_length(past) > 0
-    except Exception:
-        return False
 # --- end helpers ---
 
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
@@ -230,9 +178,10 @@ class MistralAttention_KIVI(nn.Module):
             value_mn = past_key_value[7]
 
             if key_states_quant_trans is not None:
-                key_states_quant_trans_repeat = _repeat_to_match_heads(key_states_quant_trans, query_states.shape[1])
-                key_scale_trans_repeat        = _repeat_to_match_heads(key_scale_trans,        query_states.shape[1])
-                key_mn_trans_repeat           = _repeat_to_match_heads(key_mn_trans,           query_states.shape[1])
+                # import ipdb; ipdb.set_trace()
+                key_states_quant_trans_repeat = repeat_kv_quant(key_states_quant_trans, self.num_key_value_groups)
+                key_scale_trans_repeat = repeat_kv_quant(key_scale_trans, self.num_key_value_groups)
+                key_mn_trans_repeat = repeat_kv_quant(key_mn_trans, self.num_key_value_groups)
                 att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states.contiguous(), key_states_quant_trans_repeat, 
                                 key_scale_trans_repeat, key_mn_trans_repeat, self.k_bits) # key_states_quant_trans, key_scale_trans, key_mn_trans need to be repeated
             else:
@@ -243,49 +192,32 @@ class MistralAttention_KIVI(nn.Module):
             else:
                 key_states_full = key_states
             
-            key_states_full_repeat = _repeat_to_match_heads(key_states_full, query_states.shape[1])
+            key_states_full_repeat = repeat_kv(key_states_full, self.num_key_value_groups)
             att_qkfull = torch.matmul(query_states, key_states_full_repeat.transpose(2, 3)) # key_states_full need to be repeated
             if att_qkquant is not None:
                 attn_weights = torch.cat([att_qkquant, att_qkfull], dim=-1) / math.sqrt(self.head_dim)
             else:
                 attn_weights = att_qkfull / math.sqrt(self.head_dim)
 
-            # --- K rolling (prefill / cache-path #1): quantize only multiples of group_size ---
-            key_states_quant_trans_new = None
-            key_scale_trans_new = None
-            key_mn_trans_new = None
-            _k_overflow = key_states_full.shape[-2] - self.residual_length
-            if _k_overflow > 0:
-                kq = (_k_overflow // self.group_size) * self.group_size  # quantizable chunk
-                if kq > 0:
-                    k_to_quant = key_states_full[:, :, :kq, :].transpose(2, 3).contiguous()
-                    key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = triton_quantize_and_pack_along_last_dim(
-                        k_to_quant, self.group_size, self.k_bits
-                    )
-                    # keep the tail (residual_length + remainder) in full precision
-                    key_states_full = key_states_full[:, :, kq:, :].contiguous()
-            # append only if a new chunk was produced
-            key_states_quant_trans = _safe_cat_dim(key_states_quant_trans, key_states_quant_trans_new, dim=3)
-            key_scale_trans        = _safe_cat_dim(key_scale_trans,        key_scale_trans_new,        dim=3)
-            key_mn_trans           = _safe_cat_dim(key_mn_trans,           key_mn_trans_new,           dim=3)
-
-            # --- Normalize attn length to expected kv length ---
-            # Prefer the mask's kv length if provided; otherwise infer from cache structure.
-            expected_kv = (attention_mask.size(-1) if attention_mask is not None
-                           else ((0 if key_states_quant_trans is None else key_states_quant_trans.shape[3])
-                                 + (0 if key_states_full is None else key_states_full.shape[-2])))
-            if attn_weights.size(-1) != expected_kv:
-                if attn_weights.size(-1) > expected_kv:
-                    # Truncate surplus logits (typically duplicated/overcounted quantized-K tail).
-                    attn_weights = attn_weights[..., :expected_kv]
+            if key_states_full.shape[-2] == self.residual_length:
+                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = triton_quantize_and_pack_along_last_dim(key_states_full.transpose(2, 3).contiguous(), 
+                                                                                                                            self.group_size, 
+                                                                                                                            self.k_bits)
+                key_states_full = None
+                if key_states_quant_trans is not None:
+                    key_states_quant_trans = torch.cat([key_states_quant_trans, key_states_quant_trans_new], dim=3)
+                    key_scale_trans = torch.cat([key_scale_trans, key_scale_trans_new], dim=3)
+                    key_mn_trans = torch.cat([key_mn_trans, key_mn_trans_new], dim=3)
                 else:
-                    # Rare: pad with -inf so softmax ignores the padded tail.
-                    pad_len = expected_kv - attn_weights.size(-1)
-                    pad_val = torch.finfo(attn_weights.dtype).min
-                    pad = torch.full(attn_weights.shape[:-1] + (pad_len,),
-                                     pad_val, dtype=attn_weights.dtype, device=attn_weights.device)
-                    attn_weights = torch.cat([attn_weights, pad], dim=-1)
-            kv_seq_len = expected_kv
+                    key_states_quant_trans = key_states_quant_trans_new
+                    key_scale_trans = key_scale_trans_new
+                    key_mn_trans = key_mn_trans_new
+
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
 
             if attention_mask is not None:
                 if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -303,133 +235,75 @@ class MistralAttention_KIVI(nn.Module):
             value_states_full = torch.cat([value_states_full, value_states], dim=2)
             value_full_length = value_states_full.shape[-2]
             if value_states_quant is None:
-                value_states_full_repeat = _repeat_to_match_heads(value_states_full, query_states.shape[1])
+                value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
                 attn_output = torch.matmul(attn_weights, value_states_full_repeat) # value_states_full need to be repeated
             else:
-                value_states_quant_repeat = _repeat_to_match_heads(value_states_quant, query_states.shape[1])
-                value_scale_repeat        = _repeat_to_match_heads(value_scale,        query_states.shape[1])
-                value_mn_repeat           = _repeat_to_match_heads(value_mn,           query_states.shape[1])
+                value_states_quant_repeat = repeat_kv_quant(value_states_quant, self.num_key_value_groups)
+                value_scale_repeat = repeat_kv_quant(value_scale, self.num_key_value_groups)
+                value_mn_repeat = repeat_kv_quant(value_mn, self.num_key_value_groups)
+                attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length].contiguous(), value_states_quant_repeat, 
+                                                value_scale_repeat, value_mn_repeat, self.v_bits) # value_states_quant, value_scale, value_mn need to be repeated
                 
-                k_full_length = 0 if key_states_full is None else key_states_full.shape[-2]
-                # Quantized-V attention part : length = all attn - k_full_length
-                attn_logits_q = (attn_weights[:, :, :, :-k_full_length].contiguous()
-                                 if k_full_length > 0 else attn_weights.contiguous())
+                value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
+                attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full_repeat) # value_states_full need to be repeated
 
-                K_quant = attn_logits_q.shape[-1]
-                if K_quant == 0 or value_states_quant_repeat is None:
-                    # No quantized tokens this step -> skip GEMV (use only full-V branch)
-                    attn_output = torch.zeros(
-                        (attn_weights.shape[0], self.num_heads, attn_weights.shape[2], self.head_dim),
-                        dtype=attn_weights.dtype, device=attn_weights.device
-                    )
+            if value_states_full.shape[-2] > self.residual_length:
+                assert value_states_full.shape[-2] == self.residual_length + 1
+                value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(value_states_full[:, :, :1, :].contiguous(), 
+                                                                                                self.group_size, 
+                                                                                                self.v_bits)
+                value_states_full = value_states_full[:, :, 1:, :].contiguous()
+                if value_states_quant is not None:
+                    value_states_quant = torch.cat([value_states_quant, value_states_quant_new], dim=2)
+                    value_scale = torch.cat([value_scale, scale], dim=2)
+                    value_mn = torch.cat([value_mn, mn], dim=2)
                 else:
-                    value_states_quant_repeat, value_scale_repeat, value_mn_repeat = _align_kdim(
-                        value_states_quant_repeat, value_scale_repeat, value_mn_repeat, K_quant
-                    )
-                    attn_output = cuda_bmm_fA_qB_outer(
-                        self.group_size,
-                        attn_logits_q,
-                        value_states_quant_repeat,
-                        value_scale_repeat,
-                        value_mn_repeat,
-                        self.v_bits,
-                    )
-                if k_full_length > 0:
-                    value_states_full_repeat = _repeat_to_match_heads(value_states_full, query_states.shape[1])
-                    K_val_full = value_states_full_repeat.shape[-2]
-                    if K_val_full != k_full_length:
-                        if K_val_full > k_full_length:
-                            value_states_full_repeat = value_states_full_repeat[:, :, :k_full_length, :].contiguous()
-                        else:
-                            padK = k_full_length - K_val_full
-                            pad  = torch.zeros(
-                                value_states_full_repeat.shape[0], value_states_full_repeat.shape[1],
-                                padK, value_states_full_repeat.shape[3],
-                                dtype=value_states_full_repeat.dtype, device=value_states_full_repeat.device
-                            )
-                            value_states_full_repeat = torch.cat([value_states_full_repeat, pad], dim=2).contiguous()
-                    attn_output += torch.matmul(attn_weights[:, :, :, -k_full_length:], value_states_full_repeat)
-
-            # --- V rolling uses multiple-of-group_size, same as K ---
-            _v_overflow = value_states_full.shape[-2] - self.residual_length
-            value_states_quant_new = None
-            scale = None
-            mn = None
-            if _v_overflow > 0:
-                vq = (_v_overflow // self.group_size) * self.group_size
-                if vq > 0:
-                    v_to_quant = value_states_full[:, :, :vq, :].contiguous()
-                    value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(
-                        v_to_quant, self.group_size, self.v_bits
-                    )
-                    value_states_full = value_states_full[:, :, vq:, :].contiguous()
-            value_states_quant = _safe_cat_dim(value_states_quant, value_states_quant_new, dim=2)
-            value_scale        = _safe_cat_dim(value_scale,        scale,                  dim=2)
-            value_mn           = _safe_cat_dim(value_mn,           mn,                     dim=2)
+                    value_states_quant = value_states_quant_new
+                    value_scale = scale
+                    value_mn = mn
+        
         else:
 
-            # --- K initial quantization uses the same boundary policy as rolling ---
-            k_total = key_states.shape[-2]
-            k_over  = k_total - self.residual_length
-            if k_over <= 0:
+            # quantize
+            if key_states.shape[-2] % self.residual_length != 0:
+                if key_states.shape[-2] < self.residual_length:
+                    key_states_quant = None
+                    key_states_full = key_states
+                else:
+                    key_states_quant = key_states[:, :, :-(key_states.shape[-2] % self.residual_length), :].contiguous()
+                    key_states_full = key_states[:, :, -(key_states.shape[-2] % self.residual_length):, :].contiguous()
+            else:
+                key_states_quant = key_states
+                key_states_full = None
+            if key_states_quant is not None:
+                key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(key_states_quant.transpose(2, 3).contiguous(), self.group_size, self.k_bits)
+            else:
                 key_states_quant_trans = None
                 key_scale_trans = None
                 key_mn_trans = None
-                key_states_full = key_states
-            else:
-                kq = (k_over // self.group_size) * self.group_size  # quantizable tokens
-                if kq > 0:
-                    k_src = key_states[:, :, :kq, :].transpose(2, 3).contiguous()
-                    key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(
-                        k_src, self.group_size, self.k_bits
-                    )
-                    key_states_full = key_states[:, :, kq:, :].contiguous()  # remainder + residual
-                else:
-                    key_states_quant_trans = None
-                    key_scale_trans = None
-                    key_mn_trans = None
-                    key_states_full = key_states
             
-            # --- V initial quantization aligned with K (multiple-of-group_size only) ---
-            v_total = value_states.shape[-2]
-            v_over  = v_total - self.residual_length
-            if v_over <= 0:
+            if value_states.shape[-2] <= self.residual_length:
                 value_states_quant = None
+                value_states_full = value_states
                 value_scale = None
                 value_mn = None
-                value_states_full = value_states
             else:
-                vq = (v_over // self.group_size) * self.group_size
-                if vq > 0:
-                    v_src = value_states[:, :, :vq, :].contiguous()
-                    value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(
-                        v_src, self.group_size, self.v_bits
-                    )
-                    value_states_full = value_states[:, :, vq:, :].contiguous()  # remainder + residual
-                else:
-                    value_states_quant = None
-                    value_scale = None
-                    value_mn = None
-                    value_states_full = value_states
+                value_states_quant = value_states[:, :, :-self.residual_length, :].contiguous()
+                value_states_full = value_states[:, :, -self.residual_length:, :].contiguous()
+                value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(value_states_quant, 
+                                                                                                self.group_size, 
+                                                                                                self.v_bits)
         
-            key_states   = _repeat_to_match_heads(key_states,   query_states.shape[1])
-            value_states = _repeat_to_match_heads(value_states, query_states.shape[1])
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
             attn_weights = torch.matmul(query_states, 
                                         key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-            expected_kv = (attention_mask.size(-1) if attention_mask is not None
-                           else ((0 if key_states_quant_trans is None else key_states_quant_trans.shape[3])
-                                 + (0 if key_states_full is None else key_states_full.shape[-2])))
-            if attn_weights.size(-1) != expected_kv:
-                if attn_weights.size(-1) > expected_kv:
-                    attn_weights = attn_weights[..., :expected_kv]
-                else:
-                    pad_len = expected_kv - attn_weights.size(-1)
-                    pad_val = torch.finfo(attn_weights.dtype).min
-                    pad = torch.full(attn_weights.shape[:-1] + (pad_len,),
-                                     pad_val, dtype=attn_weights.dtype, device=attn_weights.device)
-                    attn_weights = torch.cat([attn_weights, pad], dim=-1)
-            kv_seq_len = expected_kv
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
 
             if attention_mask is not None:
                 if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -446,7 +320,7 @@ class MistralAttention_KIVI(nn.Module):
                 attn_weights, dim=-1, dtype=torch.float32
             ).to(query_states.dtype)
 
-            attn_output = torch.matmul(attn_weights, value_states)
+            attn_output = torch.matmul(attn_weights, value_states) 
         past_key_value = (key_states_quant_trans, key_states_full, key_scale_trans, key_mn_trans, value_states_quant, value_states_full, value_scale, value_mn, kv_seq_len) if use_cache else None
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -476,7 +350,6 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
     def __init__(self, config: MistralConfig, nbits_key: int, nbits_value: int):
         # Call the parent's __init__ method.
         # super() will call MistralAttention_KIVI.__init__ which already contains our logic.
-        print("Init Flash Attention")
 
         super().__init__(config=config, nbits_key=nbits_key, nbits_value=nbits_value)
 
@@ -542,9 +415,9 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
             # import ipdb; ipdb.set_trace()
 
             if key_states_quant_trans is not None:
-                key_states_quant_trans_repeat = _repeat_to_match_heads(key_states_quant_trans, query_states.shape[1])
-                key_scale_trans_repeat        = _repeat_to_match_heads(key_scale_trans,        query_states.shape[1])
-                key_mn_trans_repeat           = _repeat_to_match_heads(key_mn_trans,           query_states.shape[1])
+                key_states_quant_trans_repeat = repeat_kv_quant(key_states_quant_trans, self.num_key_value_groups)
+                key_scale_trans_repeat = repeat_kv_quant(key_scale_trans, self.num_key_value_groups)
+                key_mn_trans_repeat = repeat_kv_quant(key_mn_trans, self.num_key_value_groups)
                 att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states.contiguous(), key_states_quant_trans_repeat, 
                                 key_scale_trans_repeat, key_mn_trans_repeat, self.k_bits) # key_states_quant_trans, key_scale_trans, key_mn_trans need to be repeated
             else:
@@ -554,7 +427,7 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
             else:
                 key_states_full = key_states
 
-            key_states_full_repeat = _repeat_to_match_heads(key_states_full, query_states.shape[1])
+            key_states_full_repeat = repeat_kv(key_states_full, self.num_key_value_groups)
             att_qkfull = torch.matmul(query_states, key_states_full_repeat.transpose(2, 3))
 
             if att_qkquant is not None:
@@ -562,36 +435,26 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
             else:
                 attn_weights = att_qkfull / math.sqrt(self.head_dim)
 
-            # --- K rolling (prefill / cache-path #2): same rule (multiples of group_size only) ---
-            key_states_quant_trans_new = None
-            key_scale_trans_new = None
-            key_mn_trans_new = None
-            _k_overflow = key_states_full.shape[-2] - self.residual_length
-            if _k_overflow > 0:
-                kq = (_k_overflow // self.group_size) * self.group_size
-                if kq > 0:
-                    k_to_quant = key_states_full[:, :, :kq, :].transpose(2, 3).contiguous()
-                    key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = triton_quantize_and_pack_along_last_dim(
-                        k_to_quant, self.group_size, self.k_bits
-                    )
-                    key_states_full = key_states_full[:, :, kq:, :].contiguous()
-            key_states_quant_trans = _safe_cat_dim(key_states_quant_trans, key_states_quant_trans_new, dim=3)
-            key_scale_trans        = _safe_cat_dim(key_scale_trans,        key_scale_trans_new,        dim=3)
-            key_mn_trans           = _safe_cat_dim(key_mn_trans,           key_mn_trans_new,           dim=3)
-
-            expected_kv = (attention_mask.size(-1) if attention_mask is not None
-                           else ((0 if key_states_quant_trans is None else key_states_quant_trans.shape[3])
-                                 + (0 if key_states_full is None else key_states_full.shape[-2])))
-            if attn_weights.size(-1) != expected_kv:
-                if attn_weights.size(-1) > expected_kv:
-                    attn_weights = attn_weights[..., :expected_kv]
+            if key_states_full.shape[-2] == self.residual_length:
+                assert self.residual_length % self.group_size == 0
+                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = triton_quantize_and_pack_along_last_dim(key_states_full.transpose(2, 3).contiguous(), 
+                                                                                                                            self.group_size, 
+                                                                                                                            self.k_bits)
+                key_states_full = None
+                if key_states_quant_trans is not None:
+                    key_states_quant_trans = torch.cat([key_states_quant_trans, key_states_quant_trans_new], dim=3)
+                    key_scale_trans = torch.cat([key_scale_trans, key_scale_trans_new], dim=3)
+                    key_mn_trans = torch.cat([key_mn_trans, key_mn_trans_new], dim=3)
                 else:
-                    pad_len = expected_kv - attn_weights.size(-1)
-                    pad_val = torch.finfo(attn_weights.dtype).min
-                    pad = torch.full(attn_weights.shape[:-1] + (pad_len,),
-                                     pad_val, dtype=attn_weights.dtype, device=attn_weights.device)
-                    attn_weights = torch.cat([attn_weights, pad], dim=-1)
-            kv_seq_len = expected_kv
+                    key_states_quant_trans = key_states_quant_trans_new
+                    key_scale_trans = key_scale_trans_new
+                    key_mn_trans = key_mn_trans_new
+
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
 
             if attention_mask is not None:
                 if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -609,78 +472,41 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
             value_states_full = torch.cat([value_states_full, value_states], dim=2)
             value_full_length = value_states_full.shape[-2]
             if value_states_quant is None:
-                value_states_full_repeat = _repeat_to_match_heads(value_states_full, query_states.shape[1])
+                value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
                 attn_output = torch.matmul(attn_weights, value_states_full_repeat)
             else:
-                value_states_quant_repeat = _repeat_to_match_heads(value_states_quant, query_states.shape[1])
-                value_scale_repeat        = _repeat_to_match_heads(value_scale,        query_states.shape[1])
-                value_mn_repeat           = _repeat_to_match_heads(value_mn,           query_states.shape[1])
-                # Quantized-V attention part: align K across logits and packed V
+                value_states_quant_repeat = repeat_kv_quant(value_states_quant, self.num_key_value_groups)
+                value_scale_repeat = repeat_kv_quant(value_scale, self.num_key_value_groups)
+                value_mn_repeat = repeat_kv_quant(value_mn, self.num_key_value_groups)
+                attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length].contiguous(), value_states_quant_repeat, 
+                                                value_scale_repeat, value_mn_repeat, self.v_bits) # value_states_quant, value_scale, value_mn need to be repeated
                 
-                k_full_length = 0 if key_states_full is None else key_states_full.shape[-2]
-                attn_logits_q = (attn_weights[:, :, :, :-k_full_length].contiguous()
-                                 if k_full_length > 0 else attn_weights.contiguous())
+                value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
+                attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full_repeat) # value_states_full need to be repeated
 
-                K_quant = attn_logits_q.shape[-1]
-                if K_quant == 0 or value_states_quant_repeat is None:
-                    # No quantized tokens this step -> skip GEMV (use only full-V branch)
-                    attn_output = torch.zeros(
-                        (attn_weights.shape[0], self.num_heads, attn_weights.shape[2], self.head_dim),
-                        dtype=attn_weights.dtype, device=attn_weights.device
-                    )
-                else:
-                    value_states_quant_repeat, value_scale_repeat, value_mn_repeat = _align_kdim(
-                        value_states_quant_repeat, value_scale_repeat, value_mn_repeat, K_quant
-                    )
-                    attn_output = cuda_bmm_fA_qB_outer(
-                        self.group_size,
-                        attn_logits_q,
-                        value_states_quant_repeat,
-                        value_scale_repeat,
-                        value_mn_repeat,
-                        self.v_bits,
-                    )
-                
-                if k_full_length > 0:
-                    value_states_full_repeat = _repeat_to_match_heads(value_states_full, query_states.shape[1])
-                    K_val_full = value_states_full_repeat.shape[-2]
-                    if K_val_full != k_full_length:
-                        if K_val_full > k_full_length:
-                            value_states_full_repeat = value_states_full_repeat[:, :, :k_full_length, :].contiguous()
-                        else:
-                            padK = k_full_length - K_val_full
-                            pad  = torch.zeros(
-                                value_states_full_repeat.shape[0], value_states_full_repeat.shape[1],
-                                padK, value_states_full_repeat.shape[3],
-                                dtype=value_states_full_repeat.dtype, device=value_states_full_repeat.device
-                            )
-                            value_states_full_repeat = torch.cat([value_states_full_repeat, pad], dim=2).contiguous()
-                    attn_output += torch.matmul(attn_weights[:, :, :, -k_full_length:], value_states_full_repeat)
             attn_output = attn_output.transpose(1, 2).contiguous()
 
-            # --- V rolling (FA path) uses multiple-of-group_size, same as K ---
-            value_states_quant_new = None
-            scale = None
-            mn = None
-            _v_overflow = value_full_length - self.residual_length
-            if _v_overflow > 0:
-                vq = (_v_overflow // self.group_size) * self.group_size
-                if vq > 0:
-                    v_to_quant = value_states_full[:, :, :vq, :].contiguous()
-                    value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(
-                        v_to_quant, self.group_size, self.v_bits
-                    )
-                    value_states_full = value_states_full[:, :, vq:, :].contiguous()
-            value_states_quant = _safe_cat_dim(value_states_quant, value_states_quant_new, dim=2)
-            value_scale        = _safe_cat_dim(value_scale,        scale,                  dim=2)
-            value_mn           = _safe_cat_dim(value_mn,           mn,                     dim=2)
+            if value_full_length > self.residual_length:
+                assert value_full_length == self.residual_length + 1
+                value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(value_states_full[:, :, :1, :].contiguous(), 
+                                                                                                self.group_size, 
+                                                                                                self.v_bits)
+                value_states_full = value_states_full[:, :, 1:, :].contiguous()
+                if value_states_quant is not None:
+                    value_states_quant = torch.cat([value_states_quant, value_states_quant_new], dim=2)
+                    value_scale = torch.cat([value_scale, scale], dim=2)
+                    value_mn = torch.cat([value_mn, mn], dim=2)
+                else:
+                    value_states_quant = value_states_quant_new
+                    value_scale = scale
+                    value_mn = mn
 
 
         else:
             # print(f"kivi with flash! {self.k_bits}")
 
-            key_states_repeat   = _repeat_to_match_heads(key_states,   query_states.shape[1])
-            value_states_repeat = _repeat_to_match_heads(value_states, query_states.shape[1])
+            key_states_repeat = repeat_kv(key_states, self.num_key_value_groups)
+            value_states_repeat = repeat_kv(value_states, self.num_key_value_groups)
 
             input_dtype = query_states.dtype
             if input_dtype == torch.float32:
@@ -703,50 +529,35 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 query_states.transpose(1, 2), key_states_repeat.transpose(1, 2), 
                 value_states_repeat.transpose(1, 2), None, q_len, dropout=0.0
             )
-
-            # --- K initial quantization (FA path) ---
-            k_total = key_states.shape[-2]
-            k_over  = k_total - self.residual_length
-            if k_over <= 0:
+            # quantize
+            if key_states.shape[-2] % self.residual_length != 0:
+                if key_states.shape[-2] < self.residual_length:
+                    key_states_quant = None
+                    key_states_full = key_states
+                else:
+                    key_states_quant = key_states[:, :, :-(key_states.shape[-2] % self.residual_length), :].contiguous()
+                    key_states_full = key_states[:, :, -(key_states.shape[-2] % self.residual_length):, :].contiguous()
+            else:
+                key_states_quant = key_states
+                key_states_full = None
+            if key_states_quant is not None:
+                key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(key_states_quant.transpose(2, 3).contiguous(), self.group_size, self.k_bits)
+            else:
                 key_states_quant_trans = None
                 key_scale_trans = None
                 key_mn_trans = None
-                key_states_full = key_states
-            else:
-                kq = (k_over // self.group_size) * self.group_size
-                if kq > 0:
-                    k_src = key_states[:, :, :kq, :].transpose(2, 3).contiguous()
-                    key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(
-                        k_src, self.group_size, self.k_bits
-                    )
-                    key_states_full = key_states[:, :, kq:, :].contiguous()
-                else:
-                    key_states_quant_trans = None
-                    key_scale_trans = None
-                    key_mn_trans = None
-                    key_states_full = key_states
             
-            # --- V initial quantization (FA path) ---
-            v_total = value_states.shape[-2]
-            v_over  = v_total - self.residual_length
-            if v_over <= 0:
+            if value_states.shape[-2] <= self.residual_length:
                 value_states_quant = None
+                value_states_full = value_states
                 value_scale = None
                 value_mn = None
-                value_states_full = value_states
             else:
-                vq = (v_over // self.group_size) * self.group_size
-                if vq > 0:
-                    v_src = value_states[:, :, :vq, :].contiguous()
-                    value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(
-                        v_src, self.group_size, self.v_bits
-                    )
-                    value_states_full = value_states[:, :, vq:, :].contiguous()
-                else:
-                    value_states_quant = None
-                    value_scale = None
-                    value_mn = None
-                    value_states_full = value_states
+                value_states_quant = value_states[:, :, :-self.residual_length, :].contiguous()
+                value_states_full = value_states[:, :, -self.residual_length:, :].contiguous()
+                value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(value_states_quant, 
+                                                                                                self.group_size, 
+                                                                                                self.v_bits)
             
         past_key_value = (key_states_quant_trans, key_states_full, key_scale_trans, key_mn_trans, 
                           value_states_quant, value_states_full, value_scale, value_mn, kv_seq_len) if use_cache else None
