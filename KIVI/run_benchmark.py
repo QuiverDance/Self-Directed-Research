@@ -381,16 +381,45 @@ def run_mmlu(model, tokenizer, cfg):
             pass
         return "A"
 
-    demos = {s: MMLUExample(s, r["question"], r["choices"], _to_letter(r["answer"]))
-             for s in MMLU_SUBJECTS
-             for r in [rng.choice(ds_loader(s, "dev"))] if ds_loader(s, "dev")}
     pool = [MMLUExample(s, r["question"], r["choices"], _to_letter(r["answer"]))
             for s in MMLU_SUBJECTS
             for r in ds_loader(s, "test")]
     rng.shuffle(pool)
     eval_set = pool[:cfg['num_samples']]
     
-    prompts = [f"Subject: {e.subject.replace('_', ' ')}\n\n" + (f"Question: {demos[e.subject].question}\n" + "\n".join(f"{c}. {demos[e.subject].choices[i]}" for i, c in enumerate(CHOICES)) + f"\nAnswer: {demos[e.subject].answer}\n\n" if e.subject in demos and cfg['kshot'] >= 1 else "") + f"Question: {e.question}\n" + "\n".join(f"{c}. {e.choices[i]}" for i, c in enumerate(CHOICES)) + "\nAnswer:" for e in eval_set]
+    def _sample_demos(subj: str, k: int) -> List[MMLUExample]:
+        """Return up to k demos from the subject's DEV split."""
+        if k <= 0:
+            return []
+        dev = ds_loader(subj, "dev")
+        if len(dev) == 0:
+            return []
+        take = min(k, len(dev))
+        idxs = rng.sample(range(len(dev)), take)
+        out: List[MMLUExample] = []
+        for i in idxs:
+            r = dev[i]
+            out.append(MMLUExample(subj, r["question"], r["choices"], _to_letter(r["answer"])))
+        return out
+
+    def _format_prompt(e: MMLUExample) -> str:
+        """Build instruction + optional k-shot demos + question."""
+        subject = e.subject.replace("_", " ")
+        header = (
+            f"The following are multiple choice questions (with answers) about {subject}.\n"
+            "Choose the correct answer from A to D. Answer with a single letter.\n\n"
+        )
+        demo_text = ""
+        k = int(cfg.get("kshot", 0))
+        if k > 0:
+            demos = _sample_demos(e.subject, k)
+            for d in demos:
+                choices_demo = "\n".join(f"{c}. {d.choices[i]}" for i, c in enumerate(CHOICES))
+                demo_text += f"Q: {d.question}\n{choices_demo}\nAnswer: {d.answer}\n\n"
+        choices = "\n".join(f"{c}. {e.choices[i]}" for i, c in enumerate(CHOICES))
+        return header + demo_text + f"Q: {e.question}\n{choices}\nAnswer:"
+
+    prompts = [_format_prompt(e) for e in eval_set]
     golds = [e.answer for e in eval_set]
     
     print(f"[MMLU] Generating for {len(prompts)} samples (1-token decoding for measurement)...")
