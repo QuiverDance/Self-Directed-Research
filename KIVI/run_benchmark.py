@@ -33,17 +33,6 @@ try:
 except Exception:
     np = None
 
-# clear CUDA memory
-def _cleanup_cuda():
-    import gc, torch
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    gc.collect()
-
-_cleanup_cuda()
-
 # --- KIVI Model Imports ---
 try:
     from models.mistral_kivi import MistralForCausalLM_KIVI
@@ -69,7 +58,7 @@ BENCH_ALL_CONFIG = {
     "gsm8k":       {"num_samples": 10, "kshot": 1, "batch_size": 8, "max_new_tokens": 256},
     "humaneval":   {"num_samples": 164, "kshot": 0, "batch_size": 1, "max_new_tokens": 512},
     "line_retrieval": {
-        "num_samples": 200, "batch_size": 1, "max_new_tokens": 64,
+        "num_samples": 200, "batch_size": 1, "max_new_tokens": 16,
         "lr_num_lines": 1000, "lr_min_words": 5, "lr_max_words": 9, "lr_target_mode": "random",
     },
     "longbench_qasper":  {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
@@ -85,7 +74,15 @@ BENCH_ALL_CONFIG = {
 # ==========================================================================================
 # Performance & Utility Helpers
 # ==========================================================================================
-
+# clear CUDA memory
+def _cleanup_cuda():
+    import gc, torch
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+    
 def _is_cuda(device) -> bool:
     return torch.cuda.is_available() and getattr(device, "type", "") == "cuda"
 
@@ -773,6 +770,8 @@ def run_needle(model, tokenizer, cfg):
 # Main Orchestrator
 # ==========================================================================================
 def main():
+    _cleanup_cuda()
+
     parser = argparse.ArgumentParser(description="KIVI Benchmark Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="Path to the model directory.")
     parser.add_argument("--layer-quant-config-path", type=str, default=None, help="Path to KVTuner JSON config.")
