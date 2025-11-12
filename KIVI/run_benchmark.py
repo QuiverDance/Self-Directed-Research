@@ -422,7 +422,8 @@ def run_mmlu(model, tokenizer, cfg):
     prompts = [_format_prompt(e) for e in eval_set]
     golds = [e.answer for e in eval_set]
     
-    print(f"[MMLU] Generating for {len(prompts)} samples (1-token decoding for measurement)...")
+    shot_tag = int(cfg.get("kshot", 0))
+    print(f"[MMLU] Generating for {len(prompts)} samples (1-token decoding) [{shot_tag}-shot]...")
     # Generate exactly 1 token to both decide the choice and measure throughput
     outputs, per_batch_stats = generate_and_measure(
         model, tokenizer, prompts,
@@ -443,18 +444,51 @@ def run_gsm8k(model, tokenizer, cfg):
     print("[GSM8K] Preparing dataset...")
     rng = random.Random(SEED)
     
-    # Corrected: Removed trust_remote_code=True
-    demo_r = rng.choice(list(load_dataset("gsm8k", "main", split="train")))
-    demo = GSM8KExample(demo_r["question"], demo_r["answer"])
+    train_set = list(load_dataset("gsm8k", "main", split="train"))
     
     pool = list(load_dataset("gsm8k", "main", split="test"))
     rng.shuffle(pool)
     eval_set = [GSM8KExample(r["question"], r["answer"]) for r in pool[:cfg['num_samples']]]
     
-    prompts = [f"Problem:\n{demo.question}\n\nSolution:\n{demo.answer}\n\n" + f"Problem:\n{e.question}\n\nSolution:\n" if cfg['kshot'] >= 1 else f"Problem:\n{e.question}\n\nSolution:\n" for e in eval_set]
+    # k-shot demo sampler (uses BENCH_ALL_CONFIG['gsm8k']['kshot'])
+    def _sample_demos(k: int):
+        """Return k demos from train split, deterministically by SEED."""
+        if k <= 0: return []
+        take = min(k, len(train_set))
+        idxs = rng.sample(range(len(train_set)), take)
+        out = []
+        for i in idxs:
+            r = train_set[i]
+            out.append(GSM8KExample(r["question"], r["answer"]))
+        return out
+
+    k = int(cfg.get("kshot", 0))
+    demos = _sample_demos(k)
+
+    def _format_prompt(e: GSM8KExample) -> str:
+        """
+        Build a GSM8K prompt:
+          - Instruction header explicitly asks to place the final numeric answer after '####'
+          - Optional k-shot demos from the train split
+          - Target problem
+        """
+        header = (
+            "Solve the following grade school math problem step by step.\n"
+            "Put the final numeric answer after '####'.\n\n"
+        )
+        demo_text = ""
+        for d in demos:
+            demo_text += (
+                f"Problem:\n{d.question}\n\n"
+                f"Solution:\n{d.answer}\n\n"
+            )
+        return header + demo_text + f"Problem:\n{e.question}\n\nSolution:\n"
+
+    prompts = [_format_prompt(e) for e in eval_set]
+
     golds = [e.answer for e in eval_set]
     
-    print(f"[GSM8K] Generating for {len(prompts)} samples...")
+    print(f"[GSM8K] Generating for {len(prompts)} samples [{k}-shot]...")
     outputs, per_batch_stats = generate_and_measure(model, tokenizer, prompts, cfg['batch_size'], cfg['max_new_tokens'], temperature=0.0)
     
     def normalize_answer(text):
