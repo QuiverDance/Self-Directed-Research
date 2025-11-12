@@ -33,6 +33,17 @@ try:
 except Exception:
     np = None
 
+# clear CUDA memory
+def _cleanup_cuda():
+    import gc, torch
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+
+_cleanup_cuda()
+
 # --- KIVI Model Imports ---
 try:
     from models.mistral_kivi import MistralForCausalLM_KIVI
@@ -59,7 +70,7 @@ BENCH_ALL_CONFIG = {
     "humaneval":   {"num_samples": 164, "kshot": 0, "batch_size": 1, "max_new_tokens": 512},
     "line_retrieval": {
         "num_samples": 200, "batch_size": 1, "max_new_tokens": 64,
-        "lr_num_lines": 2000, "lr_min_words": 5, "lr_max_words": 9, "lr_target_mode": "random",
+        "lr_num_lines": 1000, "lr_min_words": 5, "lr_max_words": 9, "lr_target_mode": "random",
     },
     "longbench_qasper":  {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
     "longbench_hotpotqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
@@ -74,6 +85,7 @@ BENCH_ALL_CONFIG = {
 # ==========================================================================================
 # Performance & Utility Helpers
 # ==========================================================================================
+
 def _is_cuda(device) -> bool:
     return torch.cuda.is_available() and getattr(device, "type", "") == "cuda"
 
@@ -150,7 +162,7 @@ def load_kivi_model_and_tokenizer(args: argparse.Namespace) -> Tuple[Any, Any]:
     
     if is_baseline_mode:
         run_label = f"[MODE] Baseline (FP16): Loading original {mt.capitalize()}ForCausalLM."
-        model = AutoModelForCausalLM.from_pretrained(model_dir, config=cfg, torch_dtype=dtype, low_cpu_mem_usage=True, device_map=device_map).eval()
+        model = AutoModelForCausalLM.from_pretrained(model_dir, config=cfg, torch_dtype=dtype, low_cpu_mem_usage=True, device_map=device_map, attn_implementation="flash_attention_2",).eval()
     else:
         KIVIModel = {"mistral": MistralForCausalLM_KIVI, "llama": LlamaForCausalLM_KIVI}.get(mt)
         if KIVIModel is None: raise RuntimeError(f"Unsupported model_type for KIVI: {mt}")
