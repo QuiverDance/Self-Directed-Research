@@ -135,61 +135,99 @@ class TrainingArguments(transformers.TrainingArguments):
     qat: Optional[bool] = field(default=False)
     exp_name: Optional[str] = field(default="test")
 
-# KVTuner: Add a new function to parse the layer-wise quantization config file.
-def load_and_process_kvtuner_config(config_path: str) -> tuple[any, any]:
+def load_quant_config(config_path: str):
     """
-    Loads and processes a KVTuner-style layer-wise quantization configuration file.
+    Unified loader for KV-cache quantization config.
 
-    This function reads a JSON config.
-    - If "enable" is true, it creates a layer-to-bits map and returns it with the group choices.
-    - If "enable" is false, it returns a special marker "disabled".
-    - If the file doesn't exist, it returns (None, None).
-
-    Args:
-        config_path: The file path to the JSON configuration.
+    Supports this formats:
+    unified JSON with:
+       - mode: "baseline" | "kvtuner_only" | "zipcache_only" | "hybrid"
+       - kvtuner: { ... }
+       - zipcache: { ... }
 
     Returns:
-        A tuple containing:
-        - The processed configuration (a dict map, the string "disabled", or None).
-        - The list of group choices if applicable, otherwise None.
+        mode: str
+        layer_to_bits_map: dict[layer_idx -> {"nbits_key": int, "nbits_value": int}] or None
+        zipcache_cfg: dict or None
+        group_choices: list or None
     """
-    if not config_path or not os.path.exists(config_path):
-        return None, None
+    # No config -> pure baseline FP16/BF16
+    if not config_path:
+        return "baseline", None, None, None
 
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    if not os.path.exists(config_path):
+        print(f"[QuantConfig] Config file not found: {config_path}. Falling back to baseline.")
+        return "baseline", None, None, None
 
-    # Check if the layer-wise quantization is enabled in the config.
-    if not config.get("enable", False):
-        print("[KVTuner] Layer-wise quantization is DISABLED in the config file. Model will run in native FP16 mode.")
-        return "disabled", None
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
 
-    # --- Parse the configuration ---
-    quant_scheme = config["quant_scheme"]
-    candidates_map = config["candidates_index_map"]
-    
-    layer_groups = config["groups"][quant_scheme]
-    group_choices = config["group_choice"][quant_scheme]
+    # -----------------------------
+    # 1) Decide mode & sub-configs
+    # -----------------------------
+    mode = cfg.get("mode", None)
 
-    if len(layer_groups) != len(group_choices):
+    kvtuner_cfg = cfg.get("kvtuner")
+    zipcache_cfg = cfg.get("zipcache")
+
+    layer_to_bits_map = None
+    group_choices = None
+
+    # ---------------------------------
+    # 2) Parse KVTuner layer-wise config
+    # ---------------------------------
+    if mode in ("kvtuner_only", "hybrid"):
+        if kvtuner_cfg is None:
+            raise ValueError(f"[QuantConfig] mode='{mode}' but 'kvtuner' section is missing in {config_path}.")
+
+        quant_scheme = kvtuner_cfg["quant_scheme"]
+        candidates_map = kvtuner_cfg["candidates_index_map"]
+
+        groups = kvtuner_cfg["groups"]
+        group_choice_cfg = kvtuner_cfg["group_choice"]
+
+        # Support two styles:
+        #  - dict keyed by quant_scheme: groups[quant_scheme]
+        #  - direct list: groups = [...]
+        if isinstance(groups, dict):
+            layer_groups = groups[quant_scheme]
+        else:
+            layer_groups = groups
+
+        if isinstance(group_choice_cfg, dict):
+            group_choices = group_choice_cfg[quant_scheme]
+        else:
+            group_choices = group_choice_cfg
+
+        if len(layer_groups) != len(group_choices):
+            raise ValueError(
+                f"[QuantConfig] Mismatch between number of layer groups ({len(layer_groups)}) "
+                f"and group choices ({len(group_choices)}) in {config_path}."
+            )
+
+        layer_to_bits_map = {}
+        for group_of_layers, choice_index in zip(layer_groups, group_choices):
+            candidate_key = str(choice_index)
+            if candidate_key not in candidates_map:
+                raise KeyError(
+                    f"[QuantConfig] Candidate index '{candidate_key}' not found in candidates_index_map "
+                    f"in {config_path}."
+                )
+            bits_config = candidates_map[candidate_key]
+            for layer_index in group_of_layers:
+                layer_to_bits_map[layer_index] = bits_config.copy()
+
+        print(f"[QuantConfig] Loaded KVTuner layer-wise config from: {config_path}")
+
+    # ---------------------------------
+    # 3) Sanity for ZipCache config
+    # ---------------------------------
+    if mode in ("zipcache_only", "hybrid") and zipcache_cfg is None:
         raise ValueError(
-            f"Mismatch between the number of layer groups ({len(layer_groups)}) "
-            f"and group choices ({len(group_choices)}) in config file: {config_path}"
+            f"[QuantConfig] mode='{mode}' requires a 'zipcache' section in {config_path}."
         )
 
-    # --- Create the final layer-to-bits mapping ---
-    layer_to_bits_map = {}
-    for group_of_layers, choice_index in zip(layer_groups, group_choices):
-        candidate_key = str(choice_index)
-        if candidate_key not in candidates_map:
-            raise KeyError(f"Candidate index '{candidate_key}' not found in candidates_index_map in {config_path}.")
-        
-        bits_config = candidates_map[candidate_key]
-        for layer_index in group_of_layers:
-            layer_to_bits_map[layer_index] = bits_config.copy()
-    
-    print(f"[KVTuner] Loaded and processed layer-wise quantization config from: {config_path}")
-    return layer_to_bits_map, group_choices
+    return mode, layer_to_bits_map, zipcache_cfg, group_choices
 
 def process_args():
     parser = transformers.HfArgumentParser(

@@ -41,12 +41,11 @@ except ImportError:
     print("FATAL: Could not import KIVI models. Ensure 'models' dir is in PYTHONPATH.")
     sys.exit(1)
 
-# --- KVTuner Util Import ---
 try:
-    from utils.process_args import load_and_process_kvtuner_config
+    from utils.process_args import load_quant_config
 except ImportError:
-    print("Warning: Could not import KVTuner utils. Layer-wise quantization will not be available.")
-    def load_and_process_kvtuner_config(path): return None, None
+    print("Warning: Could not import quant config loader. quantization will not be available.")
+    def load_quant_config(path): return None, None
 
 # ==========================================================================================
 # Global Benchmark Configuration
@@ -151,32 +150,71 @@ def load_kivi_model_and_tokenizer(args: argparse.Namespace) -> Tuple[Any, Any]:
     model_dir = os.path.expanduser(args.model)
     dtype = torch.float16
     device_map = "auto"
+
     cfg = AutoConfig.from_pretrained(model_dir)
     mt = getattr(cfg, "model_type", None)
-    layer_quant_map, group_choices = load_and_process_kvtuner_config(args.layer_quant_config_path) if args.layer_quant_config_path else (None, None)
+    # Unified quant config loader: mode + KVTuner + ZipCache
+    mode, layer_quant_map, zipcache_cfg, group_choices = load_quant_config(
+        getattr(args, "quant_config_path", None)
+    )
+    is_baseline_mode = (mode == "baseline")
 
-    is_baseline_mode = (layer_quant_map == "disabled")
     run_label = ""
-    
     if is_baseline_mode:
         run_label = f"[MODE] Baseline (FP16): Loading original {mt.capitalize()}ForCausalLM."
-        model = AutoModelForCausalLM.from_pretrained(model_dir, config=cfg, torch_dtype=dtype, low_cpu_mem_usage=True, device_map=device_map, attn_implementation="flash_attention_2",).eval()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            config=cfg,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            device_map=device_map,
+            attn_implementation="flash_attention_2",
+        ).eval()
     else:
         KIVIModel = {"mistral": MistralForCausalLM_KIVI, "llama": LlamaForCausalLM_KIVI}.get(mt)
-        if KIVIModel is None: raise RuntimeError(f"Unsupported model_type for KIVI: {mt}")
+        if KIVIModel is None:
+            raise RuntimeError(f"Unsupported model_type for KIVI: {mt}")
         
         cfg.k_bits, cfg.v_bits = int(args.k_bits), int(args.v_bits)
         cfg.group_size, cfg.residual_length = int(args.group_size), int(args.residual_length)
-        cfg.use_flash = bool(args.use_flash)
+
+        use_flash_str = str(getattr(args, "use_flash", "true")).strip().lower()
+        cfg.use_flash = use_flash_str in ("1", "true", "yes", "y")
         # if cfg.use_flash: cfg._flash_attn_2_enabled = True
 
-        if isinstance(layer_quant_map, dict):
-            run_label = "[MODE] Quantized (KIVI) - Layer-wise"
-            if group_choices: run_label += f"\n[KVTuner] Group choices: {group_choices}"
+        # Expose quant mode and configs to the model config for later use
+        cfg.quant_mode = mode
+        cfg.layer_quant_map = layer_quant_map
+        cfg.zipcache_config = zipcache_cfg
+
+        if mode == "kvtuner_only":
+            if isinstance(layer_quant_map, dict):
+                run_label = "[MODE] Quantized (KIVI) - KVTuner Layer-wise"
+                if group_choices:
+                    run_label += f"\n[KVTuner] Group choices: {group_choices}"
+            else:
+                run_label = (
+                    "[MODE] Quantized (KIVI) - Uniform\n"
+                    f"[KIVI] Uniform Config: k_bits={cfg.k_bits}, v_bits={cfg.v_bits}"
+                )
+
+        elif mode in ("zipcache_only", "hybrid"):
+            # Parsing is implemented, but runtime ZipCache/hybrid logic is not yet wired.
+            raise NotImplementedError(
+                f"[MODE] '{mode}' is parsed from config, but ZipCache/hybrid runtime "
+                "implementation is not yet integrated into KIVI models."
+            )
         else:
-            run_label = f"[MODE] Quantized (KIVI) - Uniform\n[KIVI] Uniform Config: k_bits={cfg.k_bits}, v_bits={cfg.v_bits}"
-        
-        model = KIVIModel.from_pretrained(model_dir, config=cfg, torch_dtype=dtype, low_cpu_mem_usage=True, device_map=device_map, layer_quant_map=layer_quant_map).eval()
+            raise ValueError(f"[MODE] Unknown quantization mode: {mode}")
+
+        model = KIVIModel.from_pretrained(
+            model_dir,
+            config=cfg,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            device_map=device_map,
+            layer_quant_map=layer_quant_map,
+        ).eval()
     
     print(run_label)
     tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
@@ -995,7 +1033,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="KIVI Benchmark Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="Path to the model directory.")
-    parser.add_argument("--layer-quant-config-path", type=str, default=None, help="Path to KVTuner JSON config.")
+    parser.add_argument("--quant-config-path", type=str, default=None, help="Path to KV Quantization JSON config.")
     parser.add_argument("--k-bits", type=int, default=4); parser.add_argument("--v-bits", type=int, default=4)
     parser.add_argument("--group-size", type=int, default=32); parser.add_argument("--residual-length", type=int, default=32)
     parser.add_argument("--bench", type=str, default="mmlu", help="Benchmark to run.")
