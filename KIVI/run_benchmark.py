@@ -168,7 +168,7 @@ def load_kivi_model_and_tokenizer(args: argparse.Namespace) -> Tuple[Any, Any]:
         cfg.k_bits, cfg.v_bits = int(args.k_bits), int(args.v_bits)
         cfg.group_size, cfg.residual_length = int(args.group_size), int(args.residual_length)
         cfg.use_flash = bool(args.use_flash)
-        if cfg.use_flash: cfg._flash_attn_2_enabled = True
+        # if cfg.use_flash: cfg._flash_attn_2_enabled = True
 
         if isinstance(layer_quant_map, dict):
             run_label = "[MODE] Quantized (KIVI) - Layer-wise"
@@ -216,18 +216,15 @@ def _sample_next_token(logits: torch.Tensor, temperature: float, top_k: int, top
     return torch.multinomial(probs, num_samples=1)
 
 def generate_and_measure(model: Any, tokenizer: Any, prompts: List[str], batch_size: int, max_new_tokens: int, **gen_kwargs) -> Tuple[List[str], List[Dict]]:
-    """Generation loop with (1) low-memory prefill and (2) correct token accounting.
-    
-    Key ideas:
-      - Avoid building full-sequence logits in prefill (which triggers logits.float() → FP32 blow-up).
-        We run the *base transformer* (model.model) to create KV only, then compute logits for
-        the last step by projecting hidden states via lm_head in FP16.
-      - Fix off-by-one: record the chosen token BEFORE advancing the model by one step.
-    """
+    """Generation loop that delegates to HF generate() and collects timing/memory stats.
 
+    This function uses model.generate() directly (no custom prefill path) so that behavior
+    exactly matches the model's generation implementation (including KIVI paths).
+    """
     device = next(model.parameters()).device
-    all_outputs = []
-    per_batch_stats = []
+    all_outputs: List[str] = []
+    per_batch_stats: List[Dict] = []
+
     stop_sequences: List[str] = gen_kwargs.pop("stop_sequences", []) or []
     do_sample: bool = bool(gen_kwargs.pop("do_sample", False))
     temperature: float = float(gen_kwargs.pop("temperature", 0.0) or 0.0)
@@ -236,118 +233,92 @@ def generate_and_measure(model: Any, tokenizer: Any, prompts: List[str], batch_s
 
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i:i + batch_size]
+        if not batch_prompts:
+            continue
+
+        # Respect model context budget (same as previous low-memory path)
         budget = _model_ctx_budget(model, tokenizer, safety_margin=64)
-        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=budget).to(device)
-        if _is_cuda(device): torch.cuda.reset_peak_memory_stats(device)
-        if _is_cuda(device): torch.cuda.synchronize(device)
 
-        # ===== Low-memory prefill: build KV without full-sequence logits =====
-        t_prefill_start = time.time()
+        # Tokenize on the correct device
+        t_start = time.time()
+        if _is_cuda(device):
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+
+        inputs = tokenizer(
+            batch_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=budget,
+        ).to(device)
+
         input_ids = inputs["input_ids"]
-        attn = inputs.get("attention_mask", None)
-        seq_len = int(input_ids.size(1))
-        past = None
+        attention_mask = inputs.get("attention_mask", None)
+
+        # Single call to model.generate(): let the model handle cache, masks, positions, etc.
         with torch.inference_mode():
-            if seq_len > 1:
-                # (A) Run base transformer ONLY on T-1 tokens to build KV (no logits creation).
-                pre_ids = input_ids[:, :-1]
-                pre_mask = attn[:, :-1] if attn is not None else None
-                base_out = model.model(
-                    input_ids=pre_ids,
-                    attention_mask=pre_mask,
-                    use_cache=True,
-                    return_dict=True,
-                )
-                past = base_out.past_key_values
-                del base_out
-            # (B) One step on the last token → project hidden via lm_head (keeps FP16; tiny B×1×V).
-            last_tok = input_ids[:, -1:].contiguous()
-            step_out = model.model(
-                input_ids=last_tok,
-                attention_mask=None,           # past already encodes sequence; mask not needed here
+            gen_out = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature if do_sample else 0.0,
+                top_k=top_k if top_k > 0 else None,
+                top_p=top_p,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
                 use_cache=True,
-                past_key_values=past,
-                return_dict=True,
             )
-            past = step_out.past_key_values
-            last_hidden = step_out.last_hidden_state[:, -1:, :]   # [B,1,H]
-            last_logits = model.lm_head(last_hidden)              # [B,1,V] in model dtype (FP16/BF16)
-            del step_out
-        # Free tokenizer tensors early to reduce peaks
-        del inputs
-        if _is_cuda(device): torch.cuda.synchronize(device)
-        if _is_cuda(device): torch.cuda.empty_cache()
-        ttft = time.time() - t_prefill_start
 
-        generated_ids_batch: List[List[int]] = [[] for _ in range(len(batch_prompts))]
-        done = [False] * len(batch_prompts)
-        t_decode_start = time.time()
+        if _is_cuda(device):
+            torch.cuda.synchronize(device)
+            peak_mem = torch.cuda.max_memory_allocated(device)
+        else:
+            peak_mem = 0
 
-        # Start from the prefill logits
-        if last_logits.dim() == 3 and last_logits.size(1) == 1:
-            last_logits = last_logits[:, -1, :]  # [B, V]
+        total_duration = time.time() - t_start
 
-        for _ in range(max_new_tokens):
-            # 1) choose next token from last logits
-            next_ids = (torch.argmax(last_logits, dim=-1, keepdim=True)
-                        if not do_sample else _sample_next_token(last_logits, temperature, top_k, top_p))
+        # Decode only the newly generated tokens and apply optional stop sequences.
+        batch_texts: List[str] = []
+        num_new_tokens = 0
+        for in_ids, out_ids in zip(input_ids, gen_out):
+            # Only tokens after the prompt are counted as "new"
+            prompt_len = in_ids.size(0)
+            new_ids = out_ids[prompt_len:]
+            num_new_tokens += int(new_ids.size(0))
 
-            # 2) record the chosen token *before* advancing the model
-            for j in range(len(batch_prompts)):
-                if done[j]:
-                    continue
-                tok_id = int(next_ids[j].item())
-                generated_ids_batch[j].append(tok_id)
-                if tok_id == tokenizer.eos_token_id:
-                    done[j] = True
-                elif stop_sequences:
-                    # decode only the just-updated sequence to check suffix stop
-                    partial = tokenizer.decode(generated_ids_batch[j], skip_special_tokens=True)
-                    for ss in stop_sequences:
-                        if ss and partial.endswith(ss):
-                            done[j] = True
-                            # remove stop sequence text from final output
-                            if ss:
-                                trimmed = partial[: -len(ss)]
-                                generated_ids_batch[j] = tokenizer(trimmed, add_special_tokens=False).input_ids
-                            break
-            if all(done):
-                break
+            text = tokenizer.decode(new_ids, skip_special_tokens=True)
 
-            # 3) advance one step with the chosen tokens
-            with torch.inference_mode():
-                step_out = model.model(
-                    input_ids=next_ids,         # [B,1]
-                    attention_mask=None,
-                    use_cache=True,
-                    past_key_values=past,
-                    return_dict=True,
-                )
-                past = step_out.past_key_values
-                last_hidden = step_out.last_hidden_state[:, -1:, :]   # [B,1,H]
-                last_logits = model.lm_head(last_hidden)               # [B,1,V]
-                del step_out
-            if last_logits.dim() == 3 and last_logits.size(1) == 1:
-                last_logits = last_logits[:, -1, :]  # [B, V]
+            if stop_sequences:
+                cut = len(text)
+                for ss in stop_sequences:
+                    if not ss:
+                        continue
+                    idx = text.find(ss)
+                    if idx != -1:
+                        cut = min(cut, idx)
+                text = text[:cut]
 
-        if _is_cuda(device): torch.cuda.synchronize(device)
-        decode_duration = time.time() - t_decode_start
-        peak_mem = torch.cuda.max_memory_allocated(device) if _is_cuda(device) else 0
+            batch_texts.append(text)
 
-        batch_outputs = [tokenizer.decode(ids, skip_special_tokens=True) for ids in generated_ids_batch]
-        all_outputs.extend(batch_outputs)
-        num_new_tokens = sum(len(ids) for ids in generated_ids_batch)
+        all_outputs.extend(batch_texts)
 
         per_batch_stats.append({
-            "batch_index": i // batch_size, "num_prompts": len(batch_prompts),
-            "ttft_sec": round(ttft, 4),
-            "decode_duration_sec": round(decode_duration, 4),
+            "batch_index": i // batch_size,
+            "num_prompts": len(batch_prompts),
+            # We can no longer split prefill vs decode; treat full generate() call as TTFT.
+            "ttft_sec": round(total_duration, 4),
+            "decode_duration_sec": 0.0,
             "new_tokens": num_new_tokens,
-            "throughput_tok_per_sec": round(num_new_tokens / (ttft + decode_duration) if (ttft + decode_duration) > 0 else 0, 2),
-            "peak_inference_mem_bytes": peak_mem
+            "throughput_tok_per_sec": round(
+                num_new_tokens / max(total_duration, 1e-6), 2
+            ),
+            "peak_inference_mem_bytes": peak_mem,
         })
 
-        print(f"  ... Generated {len(all_outputs)} / {len(prompts)}", end='\r')
+        print(f"  ... Generated {len(all_outputs)} / {len(prompts)}", end="\r")
+
     print()
     return all_outputs, per_batch_stats
 
@@ -444,51 +415,18 @@ def run_gsm8k(model, tokenizer, cfg):
     print("[GSM8K] Preparing dataset...")
     rng = random.Random(SEED)
     
-    train_set = list(load_dataset("gsm8k", "main", split="train"))
+    # Corrected: Removed trust_remote_code=True
+    demo_r = rng.choice(list(load_dataset("gsm8k", "main", split="train")))
+    demo = GSM8KExample(demo_r["question"], demo_r["answer"])
     
     pool = list(load_dataset("gsm8k", "main", split="test"))
     rng.shuffle(pool)
     eval_set = [GSM8KExample(r["question"], r["answer"]) for r in pool[:cfg['num_samples']]]
     
-    # k-shot demo sampler (uses BENCH_ALL_CONFIG['gsm8k']['kshot'])
-    def _sample_demos(k: int):
-        """Return k demos from train split, deterministically by SEED."""
-        if k <= 0: return []
-        take = min(k, len(train_set))
-        idxs = rng.sample(range(len(train_set)), take)
-        out = []
-        for i in idxs:
-            r = train_set[i]
-            out.append(GSM8KExample(r["question"], r["answer"]))
-        return out
-
-    k = int(cfg.get("kshot", 0))
-    demos = _sample_demos(k)
-
-    def _format_prompt(e: GSM8KExample) -> str:
-        """
-        Build a GSM8K prompt:
-          - Instruction header explicitly asks to place the final numeric answer after '####'
-          - Optional k-shot demos from the train split
-          - Target problem
-        """
-        header = (
-            "Solve the following grade school math problem step by step.\n"
-            "Put the final numeric answer after '####'.\n\n"
-        )
-        demo_text = ""
-        for d in demos:
-            demo_text += (
-                f"Problem:\n{d.question}\n\n"
-                f"Solution:\n{d.answer}\n\n"
-            )
-        return header + demo_text + f"Problem:\n{e.question}\n\nSolution:\n"
-
-    prompts = [_format_prompt(e) for e in eval_set]
-
+    prompts = [f"Problem:\n{demo.question}\n\nSolution:\n{demo.answer}\n\n" + f"Problem:\n{e.question}\n\nSolution:\n" if cfg['kshot'] >= 1 else f"Problem:\n{e.question}\n\nSolution:\n" for e in eval_set]
     golds = [e.answer for e in eval_set]
     
-    print(f"[GSM8K] Generating for {len(prompts)} samples [{k}-shot]...")
+    print(f"[GSM8K] Generating for {len(prompts)} samples...")
     outputs, per_batch_stats = generate_and_measure(model, tokenizer, prompts, cfg['batch_size'], cfg['max_new_tokens'], temperature=0.0)
     
     def normalize_answer(text):
