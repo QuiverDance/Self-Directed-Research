@@ -55,16 +55,16 @@ DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 BENCH_ALL_CONFIG = {
     "mmlu":        {"num_samples": 14042, "kshot": 1, "batch_size": 16, "max_new_tokens": 1},
     "gsm8k":       {"num_samples": 1319, "kshot": 1, "batch_size": 16, "max_new_tokens": 256},
-    "humaneval":   {"num_samples": 164, "batch_size": 16, "max_new_tokens": 512},
+    # "humaneval":   {"num_samples": 164, "batch_size": 16, "max_new_tokens": 512},
     "line_retrieval": {
         "num_samples": 200, "batch_size": 2, "max_new_tokens": 64,
         "lr_num_lines": 1000, "lr_min_words": 5, "lr_max_words": 9, "lr_target_mode": "random",
         "lr_max_prompt_tokens": 10000,  # hard cap for prompt tokens (problem text) regardless of longer model context
     },
-    "longbench_qasper":  {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
-    "longbench_hotpotqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
-    "longbench_2wikimqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
-    "longbench_musique": {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
+    # "longbench_qasper":  {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
+    # "longbench_hotpotqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
+    # "longbench_2wikimqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
+    # "longbench_musique": {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
     "needle": {
         "num_samples": 100, "batch_size": 1, "max_new_tokens": 8,
         "nh_target_tokens": 12000, "nh_depth_mode": "random", "nh_vocab_mode": "random", "nh_depth": 0.5,
@@ -364,7 +364,8 @@ def generate_and_measure(model: Any, tokenizer: Any, prompts: List[str], batch_s
 # Benchmark Implementations
 # ==========================================================================================
 
-# ================== MMLU ==================
+# ================== MMLU =================
+DEFAULT_MMLU_LOCAL_DIR = Path(os.path.expanduser("~/Self-Directed-Research/KIVI/datasets/mmlu"))
 MMLU_SUBJECTS=["abstract_algebra","anatomy","astronomy","business_ethics","clinical_knowledge","college_biology","college_chemistry","college_computer_science","college_mathematics","college_medicine","college_physics","computer_security","conceptual_physics","econometrics","electrical_engineering","elementary_mathematics","formal_logic","global_facts","high_school_biology","high_school_chemistry","high_school_computer_science","high_school_european_history","high_school_geography","high_school_government_and_politics","high_school_macroeconomics","high_school_mathematics","high_school_microeconomics","high_school_physics","high_school_psychology","high_school_statistics","high_school_us_history","high_school_world_history","human_aging","human_sexuality","international_law","jurisprudence","logical_fallacies","machine_learning","management","marketing","medical_genetics","miscellaneous","moral_disputes","moral_scenarios","nutrition","philosophy","prehistory","professional_accounting","professional_law","professional_medicine","professional_psychology","public_relations","security_studies","sociology","us_foreign_policy","virology","world_religions"]
 CHOICES=["A","B","C","D"]
 
@@ -372,11 +373,25 @@ CHOICES=["A","B","C","D"]
 class MMLUExample:
     subject: str; question: str; choices: List[str]; answer: str
 
+def _mmlu_local_loader(subject: str, split: str):
+    """Load a local MMLU split from DEFAULT_MMLU_LOCAL_DIR.
+
+    Expects files created by prepare_mmlu_local().
+    """
+    base = DEFAULT_MMLU_LOCAL_DIR
+    path = base / subject / f"{split}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"[MMLU] Local file not found: {path}. "
+            "Run 'python run_benchmark.py --prepare-mmlu-local' first."
+        )
+    return load_dataset("json", data_files=str(path), split="train")
+
 def run_mmlu(model, tokenizer, cfg):
     print("[MMLU] Preparing dataset...")
     rng = random.Random(SEED)
-    # Corrected: Removed trust_remote_code=True
-    ds_loader = lambda s, p: load_dataset("cais/mmlu", s, split=p)
+    # Always load MMLU from local JSONL files prepared beforehand.
+    ds_loader = _mmlu_local_loader
 
     def _to_letter(ans):
         # Normalize possible formats: int index(0-3) or letter string
