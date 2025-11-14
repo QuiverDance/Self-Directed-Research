@@ -1,12 +1,12 @@
 {
   "//": "baseline | kvtuner_only | zipcache_only | hybrid",
-  "mode": "baseline", 
+  "mode": "zipcache_only", 
 
   "kvtuner": {
     "quant_scheme": "per-token-asym",
     "asymmetric": true,
 
-    "bit_candidates": [8, 4],
+    "bit_candidates": [8, 4, 2, 1],
 
     "granularity": {
         "key":   { "axis": 1, "name": "per-channel", "q_group_size": 32, "residual_length": 32 },
@@ -33,7 +33,7 @@
     "group_choice": {
         "//": "Chosen candidate index for each group in the *same order* as groups[quant_scheme].",
         "//2": "Example below corresponds to trial #4: [2,2,0,2,1]  ->  (4,4),(4,4),(8,8),(4,4),(8,4)",
-        "per-token-asym": [1, 1, 2, 2, 0]
+        "per-token-asym": [2, 2, 1, 0, 0]
     },
 
     "max_per_layer_scale": 2.0
