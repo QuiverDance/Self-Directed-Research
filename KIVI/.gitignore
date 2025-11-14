@@ -7,13 +7,10 @@ build
 *.so
 out_*
 *.sh
-*.jsonl
 *.pt
 notebook
-dataset
 output_samples
 *.pdf
-*.jsonl
 third_party
 speed_logs
 pred
