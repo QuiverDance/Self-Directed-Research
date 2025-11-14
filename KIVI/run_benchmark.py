@@ -44,8 +44,9 @@ except ImportError:
 try:
     from utils.process_args import load_quant_config
 except ImportError:
-    print("Warning: Could not import quant config loader. quantization will not be available.")
-    def load_quant_config(path): return None, None
+    print("Warning: Could not import quant config loader. Falling back to 'kvtuner_only' mode.")
+    def load_quant_config(path):
+        return "kvtuner_only", None, None, None
 
 # ==========================================================================================
 # Global Benchmark Configuration
@@ -55,16 +56,16 @@ DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 BENCH_ALL_CONFIG = {
     "mmlu":        {"num_samples": 14042, "kshot": 1, "batch_size": 16, "max_new_tokens": 1},
     "gsm8k":       {"num_samples": 1319, "kshot": 1, "batch_size": 16, "max_new_tokens": 256},
-    # "humaneval":   {"num_samples": 164, "batch_size": 16, "max_new_tokens": 512},
+    "humaneval":   {"num_samples": 164, "batch_size": 16, "max_new_tokens": 512},
     "line_retrieval": {
         "num_samples": 200, "batch_size": 2, "max_new_tokens": 64,
         "lr_num_lines": 1000, "lr_min_words": 5, "lr_max_words": 9, "lr_target_mode": "random",
         "lr_max_prompt_tokens": 10000,  # hard cap for prompt tokens (problem text) regardless of longer model context
     },
-    # "longbench_qasper":  {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
-    # "longbench_hotpotqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
-    # "longbench_2wikimqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
-    # "longbench_musique": {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
+    "longbench_qasper":  {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
+    "longbench_hotpotqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
+    "longbench_2wikimqa":{"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
+    "longbench_musique": {"num_samples": 200, "batch_size": 1, "max_new_tokens": 32},
     "needle": {
         "num_samples": 100, "batch_size": 1, "max_new_tokens": 8,
         "nh_target_tokens": 12000, "nh_depth_mode": "random", "nh_vocab_mode": "random", "nh_depth": 0.5,
@@ -199,11 +200,22 @@ def load_kivi_model_and_tokenizer(args: argparse.Namespace) -> Tuple[Any, Any]:
                 )
 
         elif mode in ("zipcache_only", "hybrid"):
-            # Parsing is implemented, but runtime ZipCache/hybrid logic is not yet wired.
-            raise NotImplementedError(
-                f"[MODE] '{mode}' is parsed from config, but ZipCache/hybrid runtime "
-                "implementation is not yet integrated into KIVI models."
-            )
+            if zipcache_cfg is None:
+                raise ValueError(
+                    "[MODE] ZipCache/hybrid mode requires a 'zipcache' section in the quant config."
+                )
+
+            # ZipCache is only implemented for the FlashAttention path.
+            if not cfg.use_flash:
+                print("[WARN] ZipCache/hybrid mode requires FlashAttention; overriding cfg.use_flash=True.")
+                cfg.use_flash = True
+
+            if mode == "zipcache_only":
+                run_label = "[MODE] Quantized (KIVI) - ZipCache only"
+            else:
+                run_label = "[MODE] Quantized (KIVI) - KVTuner + ZipCache (hybrid)"
+                if isinstance(layer_quant_map, dict) and group_choices:
+                    run_label += f"\n[KVTuner] Group choices: {group_choices}"
         else:
             raise ValueError(f"[MODE] Unknown quantization mode: {mode}")
 
@@ -294,6 +306,15 @@ def generate_and_measure(model: Any, tokenizer: Any, prompts: List[str], batch_s
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", None)
 
+        # >>> ADD: top-level debug around generate() <<<
+        print(
+            f"[DEBUG][GEN] batch={i // batch_size} "
+            f"n_prompts={len(batch_prompts)} "
+            f"input_ids={tuple(input_ids.shape)} "
+            f"max_new_tokens={max_new_tokens}",
+            flush=True,
+        )
+
         # Single call to model.generate(): let the model handle cache, masks, positions, etc.
         with torch.inference_mode():
             gen_out = model.generate(
@@ -308,6 +329,14 @@ def generate_and_measure(model: Any, tokenizer: Any, prompts: List[str], batch_s
                 pad_token_id=tokenizer.pad_token_id,
                 use_cache=True,
             )
+
+        # >>> ADD: confirm we returned from generate() <<<
+        first_shape = tuple(gen_out[0].shape) if len(gen_out) > 0 else None
+        print(
+            f"[DEBUG][GEN] batch={i // batch_size} "
+            f"generate() done, first_out={first_shape}",
+            flush=True,
+        )
 
         if _is_cuda(device):
             torch.cuda.synchronize(device)
@@ -374,18 +403,28 @@ class MMLUExample:
     subject: str; question: str; choices: List[str]; answer: str
 
 def _mmlu_local_loader(subject: str, split: str):
-    """Load a local MMLU split from DEFAULT_MMLU_LOCAL_DIR.
+    """Load a local MMLU split from DEFAULT_MMLU_LOCAL_DIR using plain JSONL.
 
-    Expects files created by prepare_mmlu_local().
+    Expected layout:
+      DEFAULT_MMLU_LOCAL_DIR/{subject}/test.jsonl
+      DEFAULT_MMLU_LOCAL_DIR/{subject}/dev.jsonl
+    Returns:
+      A list of dicts, each with keys like "question", "choices", "answer".
     """
     base = DEFAULT_MMLU_LOCAL_DIR
     path = base / subject / f"{split}.jsonl"
     if not path.exists():
-        raise FileNotFoundError(
-            f"[MMLU] Local file not found: {path}. "
-            "Run 'python run_benchmark.py --prepare-mmlu-local' first."
-        )
-    return load_dataset("json", data_files=str(path), split="train")
+        raise FileNotFoundError(f"[MMLU] Local file not found: {path}")
+
+    records = []
+    # Simple JSONL reader: one JSON object per line
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
 
 def run_mmlu(model, tokenizer, cfg):
     print("[MMLU] Preparing dataset...")
