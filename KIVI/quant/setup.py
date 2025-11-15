@@ -24,7 +24,8 @@ extra_compile_args = {
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
-        "--threads=8"
+        "--threads=8",
+        "-allow-unsupported-compiler"
     ],
 }
 

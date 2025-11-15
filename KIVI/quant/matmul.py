@@ -40,12 +40,17 @@ def qbvm_kernel(
 	feat_per_int = 32 // bits
 	num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 	num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
+	
+	batch_idx = pid_batch // M
+	m_idx = pid_batch % M
+
 	pid_n = pid % num_pid_n
 	offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
 	offs_k = tl.arange(0, BLOCK_SIZE_K)
-	a_batch_offset = (pid_batch * stride_abatch)
-	b_batch_offset = (pid_batch * stride_bbatch)
-	c_batch_offset = (pid_batch * stride_cbatch)
+
+	a_batch_offset = batch_idx * stride_abatch + m_idx * stride_am
+	b_batch_offset = batch_idx * stride_bbatch
+	c_batch_offset = batch_idx * stride_cbatch + m_idx * stride_cm
 	a_ptr = a_ptr + a_batch_offset 
 	b_ptr = b_ptr + b_batch_offset 
 	c_ptr = c_ptr + c_batch_offset
@@ -55,8 +60,8 @@ def qbvm_kernel(
 	b_ptrs = b_ptr  + (offs_k[:, None] * stride_bk + (offs_bn[None, :]//feat_per_int) * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 	# shifter is used to extract the # bits bits of each element in the 32-bit word from B
 	shifter = (offs_bn % feat_per_int) * bits
-	scales_ptr = scales_ptr + pid_batch*stride_scales_b + ((offs_bn[None, :] // groupsize)) * stride_scales_g   # (BLOCK_SIZE_N,)
-	zeros_ptr = zeros_ptr + pid_batch*stride_zeros_b + ((offs_bn[None, :] // groupsize)) * stride_zeros_g   # (BLOCK_SIZE_N,)
+	scales_ptr = scales_ptr + batch_idx*stride_scales_b + ((offs_bn[None, :] // groupsize)) * stride_scales_g   # (BLOCK_SIZE_N,)
+	zeros_ptr = zeros_ptr + batch_idx*stride_zeros_b + ((offs_bn[None, :] // groupsize)) * stride_zeros_g   # (BLOCK_SIZE_N,)
 
 	# Now calculate a block of output of shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
 	# M is along the batch dimension, N is along the outfeatures dimension, K is along the infeatures dimension
@@ -146,7 +151,7 @@ def triton_bmm_fA_qB_outer(group_size: int,
 	c = torch.empty((flatten_B, M, N), device='cuda', dtype=torch.float16)
 	# print(f'M {M} N {N} K {K}')
 	grid = lambda META: (
-		flatten_B, triton.cdiv(N, META['BLOCK_SIZE_N']),
+		flatten_B * M, triton.cdiv(N, META['BLOCK_SIZE_N']),
 	)
 	scales = scales.reshape(flatten_B, scales.shape[-2], scales.shape[-1])
 	zeros = zeros.reshape(flatten_B, zeros.shape[-2], zeros.shape[-1])

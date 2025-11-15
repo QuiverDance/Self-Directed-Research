@@ -253,20 +253,24 @@ torch::Tensor gemv_forward_cuda(
 */
 __global__ void bgemv8_kernel_outer_dim(
   const half* _inputs, const uint32_t* _weight, const half* _zeros, const half* _scale, half* _outputs, 
-  const int IC, const int OC, const int group_size, const int nh, const int nh_kv){
+  const int IC, const int OC, const int group_size, const int num_in_feats, const int nh, const int nh_kv){
     // KVTuner: Set bit-width specific constants for 8-bit.
     const int bit = 8;
     const int pack_factor = 4; // 32 / 8 = 4 values per int32
 
-    const int batch_idx = blockIdx.x;
+    const int bm_idx = blockIdx.x;
+    const int batch_idx = bm_idx / num_in_feats;   // [0, BS)
+    const int feat_idx = bm_idx % num_in_feats;    // [0, M)
+
     const int packed_oc_idx = blockIdx.y * blockDim.y + threadIdx.y; 
     const int oc_start_idx = packed_oc_idx * pack_factor;
     const int group_idx = oc_start_idx / group_size; 
     const int ICR = IC;
-    const half* inputs = _inputs + batch_idx * ICR;
-    half* outputs = _outputs + batch_idx * OC;
+    const half* inputs = _inputs + (batch_idx * num_in_feats + feat_idx) * ICR;
+    half* outputs = _outputs + (batch_idx * num_in_feats + feat_idx) * OC;
     const int ratio = nh / nh_kv;
     int _batch_idx = batch_idx / ratio;
+
     const uint32_t*  weight = _weight + _batch_idx * OC * IC / pack_factor;
     const half* scaling_factors = _scale + _batch_idx * OC * IC / group_size;
     const half* zeros = _zeros + _batch_idx * OC * IC / group_size;
@@ -339,17 +343,22 @@ Notes:
 */
 __global__ void bgemv4_kernel_outer_dim(
   const half* _inputs, const uint32_t* _weight, const half* _zeros, const half* _scale, half* _outputs, 
-  const int IC, const int OC, const int group_size, const int nh, const int nh_kv){
+  const int IC, const int OC, const int group_size, const int num_in_feats, const int nh, const int nh_kv){
     const int bit = 4;
     const int pack_factor = 8;
-    const int batch_idx = blockIdx.x;
+
+    const int bm_idx = blockIdx.x;
+    const int batch_idx = bm_idx / num_in_feats;   // [0, BS)
+    const int feat_idx = bm_idx % num_in_feats;    // [0, M)
+
     const int packed_oc_idx = blockIdx.y * blockDim.y + threadIdx.y; 
     const int oc_start_idx = packed_oc_idx * pack_factor;
     const int group_idx = oc_start_idx / group_size; 
-    const half* inputs = _inputs + batch_idx * IC;
-    half* outputs = _outputs + batch_idx * OC;
+    const half* inputs = _inputs + (batch_idx * num_in_feats + feat_idx) * IC;
+    half* outputs = _outputs + (batch_idx * num_in_feats + feat_idx) * OC;
     const int ratio = nh / nh_kv;
     int _batch_idx = batch_idx / ratio;
+
     const uint32_t*  weight = _weight + _batch_idx * OC * IC / pack_factor;
     const half* scaling_factors = _scale + _batch_idx * OC * IC / group_size;
     const half* zeros = _zeros + _batch_idx * OC * IC / group_size;
@@ -422,19 +431,24 @@ __global__ void bgemv4_kernel_outer_dim(
 
 __global__ void bgemv2_kernel_outer_dim(
   const half* _inputs, const uint32_t* _weight, const half* _zeros, const half* _scale, half* _outputs, 
-  const int IC, const int OC, const int group_size, const int nh, const int nh_kv){
+  const int IC, const int OC, const int group_size, const int num_in_feats, const int nh, const int nh_kv){
     // const int group_size = 64;
     const int bit = 2;
     const int pack_factor = 16;
-    const int batch_idx = blockIdx.x;
+
+    const int bm_idx = blockIdx.x;
+    const int batch_idx = bm_idx / num_in_feats;   // [0, BS)
+    const int feat_idx = bm_idx % num_in_feats;    // [0, M)
+
     const int packed_oc_idx = blockIdx.y * blockDim.y + threadIdx.y; 
     const int oc_start_idx = packed_oc_idx * pack_factor;
     const int group_idx = oc_start_idx / group_size; 
     const int ICR = IC;
-    const half* inputs = _inputs + batch_idx * ICR;
-    half* outputs = _outputs + batch_idx * OC;
+    const half* inputs = _inputs + (batch_idx * num_in_feats + feat_idx) * ICR;
+    half* outputs = _outputs + (batch_idx * num_in_feats + feat_idx) * OC;
     const int ratio = nh / nh_kv;
     int _batch_idx = batch_idx / ratio;
+
     const uint32_t*  weight = _weight + _batch_idx * OC * IC / pack_factor;
     const half* scaling_factors = _scale + _batch_idx * OC * IC / group_size;
     const half* zeros = _zeros + _batch_idx * OC * IC / group_size;
@@ -620,7 +634,7 @@ torch::Tensor gemv_forward_cuda_outer_dim(
         pack_factor = 16;
     }
 
-    dim3 num_blocks(BS, (num_out_channels / pack_factor + 3) / 4, num_out_feats);
+    dim3 num_blocks(BS * num_in_feats, (num_out_channels / pack_factor + 3) / 4, 1);
     dim3 num_threads(32, 4);
 
     // KVTuner: Add branching logic to handle 2, 4, and 8-bit kernels.
@@ -629,7 +643,7 @@ torch::Tensor gemv_forward_cuda_outer_dim(
         // pointers
         in_feats, kernel, zeros, scaling_factors, out_feats,
         // constants
-        num_in_channels, num_out_channels, group_size, nh, nh_kv
+        num_in_channels, num_out_channels, group_size, num_in_feats, nh, nh_kv
       );
     }
     else if (bit == 4){
@@ -637,7 +651,7 @@ torch::Tensor gemv_forward_cuda_outer_dim(
         // pointers
         in_feats, kernel, zeros, scaling_factors, out_feats,
         // constants
-        num_in_channels, num_out_channels, group_size, nh, nh_kv
+        num_in_channels, num_out_channels, group_size, num_in_feats, nh, nh_kv
       );
     }
     else{ // bit == 2
@@ -645,7 +659,7 @@ torch::Tensor gemv_forward_cuda_outer_dim(
         // pointers
         in_feats, kernel, zeros, scaling_factors, out_feats,
         // constants
-        num_in_channels, num_out_channels, group_size, nh, nh_kv
+        num_in_channels, num_out_channels, group_size, num_in_feats, nh, nh_kv
       );     
     }
     return _out_feats;
