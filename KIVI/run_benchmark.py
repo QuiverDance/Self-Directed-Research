@@ -108,41 +108,17 @@ def _infer_input_device(model):
 
 def warmup_and_measure_base(model, tokenizer):
     """
-    Safe warmup for both sharded (device_map='auto') and single-device setups.
-    - Keep inputs on CPU; let HF dispatch handle device placement.
-    - Call CUDA sync/empty_cache only if CUDA is available.
+    Measure the baseline CUDA memory footprint **after** the model is loaded.
     """
-    tiny_input = None
-    try:
-        if torch.cuda.is_available():
-            # Do not pass a specific device; sync all current CUDA work safely.
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-        with torch.inference_mode():
-            tiny_input = tokenizer("warmup", return_tensors="pt")
-            # Move to a safe device (embedding device if available)
-            dev = _infer_input_device(model)
-            if hasattr(tiny_input, "to"):
-                tiny_input = tiny_input.to(dev)
-            else:
-                tiny_input = {k: v.to(dev) for k, v in tiny_input.items()}
-            # Use pad_token_id if available; otherwise eos
-            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-            _ = model.generate(**tiny_input, max_new_tokens=2, pad_token_id=pad_id)
-        # Report current allocated CUDA memory if CUDA exists; else 0
-        return torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
-    except Exception as e:
-        print(f"[WARN] warmup skipped (safe): {repr(e)}")
+    if not torch.cuda.is_available():
         return 0
-    finally:
-        # Make sure cleanup is robust even if tiny_input was never assigned
-        if tiny_input is not None:
-            del tiny_input
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    base_mem = torch.cuda.memory_allocated()
+    return base_mem
 
 # ==========================================================================================
 # KIVI Model Loading Utility
