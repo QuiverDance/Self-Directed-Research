@@ -53,20 +53,16 @@ def _kivi_get_past_length(past):
     if past is None:
         return 0
 
-    # 1) 리스트/튜플 형태 캐시 (KVTuner 튜플 또는 ZipCache kv_blob 리스트)
     if isinstance(past, (list, tuple)) and len(past) > 0:
         first = past[0]
 
-        # 1-1) ZipCache kv_blob: dict 안에 "shape" 저장되어 있음: (B, H_kv, T, D)
         if isinstance(first, dict):
             shape = first.get("shape", None)
             if shape is not None and len(shape) >= 3:
                 return int(shape[2])
 
-        # 1-2) 기존 KVTuner 튜플: 마지막 원소가 kv_seq_len 스칼라
         if isinstance(first, (list, tuple)) and len(first) > 0:
             last = first[-1]
-            # int 또는 0-dim tensor 모두 처리
             if isinstance(last, int):
                 return last
             if hasattr(last, "numel") and last.numel() == 1:
