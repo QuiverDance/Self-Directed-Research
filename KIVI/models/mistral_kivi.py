@@ -107,6 +107,7 @@ class ZipCacheLayerState:
 
         # Optional scratch space to accumulate streaming scores during decode.
         self._streaming_scores: Optional[torch.Tensor] = None
+        self._streaming_visible_counts: Optional[torch.Tensor] = None
 
         # Optional per-token bitwidth maps (filled after saliency is known).
         # Shape: [batch, num_heads, seq_len]
@@ -125,6 +126,7 @@ class ZipCacheLayerState:
         """
         self.decode_counter = 0
         self._streaming_scores = None
+        self._streaming_visible_counts = None
         # Per-token bit policy is tied to the current prefix; when streaming is
         # reset, we also drop any existing bit maps so that they will be recomputed.
         self.bits_k = None
@@ -157,6 +159,7 @@ class ZipCacheSaliencyControllerFlash:
         self.v_unimportant_ratio: float = float(cfg.get("v_unimportant_ratio", 0.5))
         self.probe_ratio_recent: float = float(cfg.get("probe_ratio_recent", 0.05))
         self.probe_ratio_random: float = float(cfg.get("probe_ratio_random", 0.05))
+        self.tail_keep_length: int = int(cfg.get("tail_keep_length", 100))
 
         self._validate_ratios()
 
@@ -391,14 +394,20 @@ class ZipCacheSaliencyControllerFlash:
         device = attn.device
         probe_idx_sorted = torch.sort(probe_idx).values.to(dtype=torch.long)
 
-        visible_count = torch.zeros(T, device=device, dtype=torch.float32)
-        for p in probe_idx_sorted.tolist():
-            # Token indices 0..p are visible in the probe at position p.
-            visible_count[: p + 1] += 1.0
-
-        # Avoid division by zero: if a token is never visible to any probe,
-        # we treat its visible_count as 1 to keep the raw score unchanged.
-        visible_count = torch.clamp(visible_count, min=1.0)
+        if probe_idx_sorted.numel() == 0:
+            # No probes: treat all tokens as equally visible.
+            visible_count = torch.ones(T, device=device, dtype=torch.float32)
+        else:
+            # For each position j, we need:
+            # visible_count[j] = # { p in probe_idx_sorted | p >= j }.
+            # This equals Q - (# { p | p < j }).
+            positions = torch.arange(T, device=device)
+            # num_lt[j] = number of probe indices strictly smaller than j.
+            num_lt = torch.bucketize(positions, probe_idx_sorted, right=False)
+            Q_int = int(probe_idx_sorted.numel())
+            visible_count = (Q_int - num_lt).to(torch.float32)
+            # Avoid division by zero.
+            visible_count = torch.clamp(visible_count, min=1.0)
 
         # Normalize: divide each token's total score by how many probe rows see it.
         saliency = raw / visible_count.unsqueeze(0)
@@ -484,6 +493,7 @@ class ZipCacheSaliencyControllerFlash:
 
         return unimportant_ids
 
+    @torch.no_grad()
     def update_streaming(
         self,
         attn_row: torch.Tensor,
@@ -509,50 +519,150 @@ class ZipCacheSaliencyControllerFlash:
         B, H_attn, Q, T = attn_row.shape
         assert B >= 1 and H_attn >= 1 and Q >= 1 and T >= 1, "Invalid attention row shape"
 
-        # When using grouped-query attention, the number of KV heads (H_kv)
-        # can be smaller than the number of query heads in `attn_row`.
-        # For ZipCache we only need per-token saliency, and the per-head index
-        # tensor `unimportant_ids_*` is later consumed at KV-head granularity.
+        device = attn_row.device
         num_heads = int(num_kv_heads) if num_kv_heads is not None else H_attn
 
-        # Aggregate over heads and query positions → [B, T].
-        contrib = attn_row.sum(dim=1).sum(dim=2)  # [B, T]
-
-        # Initialize or resize the streaming buffer if needed.
-        if layer_state._streaming_scores is None or layer_state._streaming_scores.shape != contrib.shape:
-            layer_state._streaming_scores = torch.zeros_like(contrib)
-
-        # Accumulate contributions and advance the decode counter.
-        layer_state._streaming_scores += contrib
+        # Increase the decode step counter for this layer. This counts all
+        # decode steps, not only the ones that are selected as probes.
         layer_state.decode_counter += 1
+        step_idx = layer_state.decode_counter - 1  # zero-based since last reset
 
-        # Only refresh saliency every `streaming_gap` steps.
+        # Decide whether this decode step should be treated as a probe row.
+        if self.streaming_gap > 0:
+            window_pos = step_idx % self.streaming_gap  # [0, streaming_gap)
+            # Always probe for the last (streaming_gap * probe_ratio_recent)
+            # steps within each window.
+            recent_len = int(self.streaming_gap * float(self.probe_ratio_recent))
+            if recent_len <= 0:
+                is_recent_probe = False
+            else:
+                recent_len = min(recent_len, self.streaming_gap)
+                recent_start = self.streaming_gap - recent_len
+                is_recent_probe = window_pos >= recent_start
+
+            # Earlier steps are probed with probability probe_ratio_random.
+            is_random_probe = False
+            if not is_recent_probe and float(self.probe_ratio_random) > 0.0:
+                # Use a small random draw on the same device as the attention.
+                if torch.rand((), device=device).item() < float(self.probe_ratio_random):
+                    is_random_probe = True
+
+            is_probe = is_recent_probe or is_random_probe
+        else:
+            # If streaming_gap <= 0, we conceptually disable streaming updates;
+            # there is no saliency refresh and this function becomes a no-op.
+            is_probe = False
+
+        scores = layer_state._streaming_scores
+        visible = layer_state._streaming_visible_counts
+
+        # If this step is a probe row, aggregate its attention contribution.
+        if is_probe:
+            # Aggregate attention over heads and query positions → [B, T].
+            contrib = attn_row.sum(dim=1).sum(dim=2)  # [B, T]
+            dtype = contrib.dtype
+
+            # Initialize or resize the streaming buffers if needed.
+            if scores is None or visible is None or scores.size(0) != B:
+                # Fresh window (or batch size changed): start accumulation from
+                # this probe row.
+                scores = contrib.detach().clone()
+                visible = torch.ones(T, device=device, dtype=dtype)
+            else:
+                old_B, old_T = scores.shape
+                if old_B != B:
+                    # Batch size changed unexpectedly; start a fresh window.
+                    scores = contrib.detach().clone()
+                    visible = torch.ones(T, device=device, dtype=dtype)
+                else:
+                    # Align the temporal dimension T if it has grown or shrunk.
+                    if old_T < T:
+                        pad = T - old_T
+                        scores = torch.nn.functional.pad(scores, (0, pad))
+                        visible = torch.nn.functional.pad(visible, (0, pad))
+                    elif old_T > T:
+                        scores = scores[:, :T]
+                        visible = visible[:T]
+                    scores = scores + contrib
+                    # Under a causal mask, all previous tokens are visible to
+                    # this probe row.
+                    visible[:T] = visible[:T] + 1.0
+
+            layer_state._streaming_scores = scores
+            layer_state._streaming_visible_counts = visible
+
+        # Only refresh saliency every `streaming_gap` steps. If streaming_gap
+        # <= 0, decode-time saliency refresh is effectively disabled.
         if self.streaming_gap <= 0 or (layer_state.decode_counter % self.streaming_gap) != 0:
             return
 
-        # ------------------------------------------------------------------
-        # 1) Build a streaming saliency estimate over the current window.
-        # ------------------------------------------------------------------
-        saliency_stream = layer_state._streaming_scores / max(layer_state.decode_counter, 1)
-        device = attn_row.device
+        # We reached the end of a window; build normalized saliency and update
+        # the unimportant token sets. If we gathered no probes in this window,
+        # simply reset the counters and return.
+        scores = layer_state._streaming_scores
+        visible = layer_state._streaming_visible_counts
+        if scores is None or visible is None:
+            layer_state._streaming_scores = None
+            layer_state._streaming_visible_counts = None
+            layer_state.decode_counter = 0
+            return
+
+        # Make sure the temporal dimensions of `scores` and `visible` match.
+        # In principle they are updated together, but shape mismatches can
+        # occur if sequence length changes between probe steps or if other
+        # code paths touched the buffers. We trust the length of `scores`
+        # (the number of tokens for which we actually accumulated attention)
+        # and trim or pad `visible` accordingly.
+        T_scores = scores.size(1)
+        T_visible = visible.size(0)
+        if T_visible != T_scores:
+            if T_visible > T_scores:
+                # Drop extra entries where we never accumulated scores.
+                visible = visible[:T_scores]
+            else:
+                # Pad with 1.0 so that tokens with no visibility count do not
+                # blow up the normalized saliency (score ~ 0, denom ~ 1).
+                pad = T_scores - T_visible
+                visible = torch.nn.functional.pad(visible, (0, pad), value=1.0)
 
         # ------------------------------------------------------------------
-        # 2) Select unimportant tokens for K and V separately, based on the
-        #    configured unimportant ratios. For K we keep (1 - k_unimportant_ratio)
-        #    fraction as salient, and similarly for V.
+        # 1) Build a normalized saliency estimate over the current window.
+        #    This mirrors Eq. (8): sum of attention over probe rows divided
+        #    by the number of probe rows in which each token is visible.
+        # ------------------------------------------------------------------
+        denom = torch.clamp(visible, min=1.0)
+        saliency_stream = scores / denom.unsqueeze(0)  # [B, T_scores]
+
+        # Optionally force the most recent `tail_keep_length` tokens to always
+        # be treated as salient when selecting unimportant tokens.
+        T_total = saliency_stream.size(1)
+        saliency_for_selection = saliency_stream
+        if self.tail_keep_length > 0 and T_total > self.tail_keep_length:
+            tail_len = min(self.tail_keep_length, T_total)
+            tail_start = T_total - tail_len
+            # Boost tail saliency slightly above the maximum so they are never
+            # picked as unimportant by the top-k selection.
+            max_per_batch, _ = saliency_stream.max(dim=-1, keepdim=True)
+            boost = max_per_batch + 1.0
+            saliency_for_selection = saliency_stream.clone()
+            saliency_for_selection[:, tail_start:] = boost.expand(-1, tail_len)
+
+        # ------------------------------------------------------------------
+        # 2) Select unimportant tokens for K and V separately based on the
+        #    configured unimportant ratios.
         # ------------------------------------------------------------------
         keep_ratio_k = 1.0 - float(self.k_unimportant_ratio)
         keep_ratio_v = 1.0 - float(self.v_unimportant_ratio)
 
         unimp_k = self._select_unimportant_from_saliency(
-            saliency=saliency_stream,
+            saliency=saliency_for_selection,
             keep_ratio=keep_ratio_k,
             batch_size=B,
             num_heads=num_heads,
             device=device,
         )
         unimp_v = self._select_unimportant_from_saliency(
-            saliency=saliency_stream,
+            saliency=saliency_for_selection,
             keep_ratio=keep_ratio_v,
             batch_size=B,
             num_heads=num_heads,
@@ -568,8 +678,8 @@ class ZipCacheSaliencyControllerFlash:
         #    start a fresh accumulation.
         # ------------------------------------------------------------------
         layer_state._streaming_scores = None
+        layer_state._streaming_visible_counts = None
         layer_state.decode_counter = 0
-
 
 class ZipCacheKVCompressorFlash:
     """
@@ -672,47 +782,15 @@ class ZipCacheKVCompressorFlash:
     # ------------------------------------------------------------------ #
     # Public API: bit assignment
     # ------------------------------------------------------------------ #
-    def assign_bits_for_tokens(
+    def get_base_and_low_bits(
         self,
         layer_idx: int,
-        zip_state: "ZipCacheLayerState",
         layer_quant_bits: Optional[Tuple[int, int]],
-        seq_len: int,
-        num_kv_heads: int,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype = torch.int32,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[int, int, int, int]:
         """
-        Compute per-token bit assignment for K/V at this layer.
-
-        Args:
-            layer_idx:
-                Index of this decoder layer.
-            zip_state:
-                ZipCacheLayerState with unimportant_ids_k/v.
-            layer_quant_bits:
-                Optional (bits_k, bits_v) from KVTuner's layer_quant_map.
-            seq_len:
-                Total KV sequence length T at this layer.
-            num_kv_heads:
-                Number of key/value heads H_kv.
-            batch_size:
-                Batch size B.
-            device:
-                Device where the bit tensors should be allocated.
-            dtype:
-                Integer dtype for the bit tensors (default: int32).
-
-        Returns:
-            {
-              "bits_k": [B, H_kv, T] int tensor,
-              "bits_v": [B, H_kv, T] int tensor,
-              "base_bits_k": int,
-              "base_bits_v": int,
-              "low_bits_k": int,
-              "low_bits_v": int,
-            }
+        Lightweight helper that returns (base_bits_k, base_bits_v,
+        low_bits_k, low_bits_v) without allocating the large per-token
+        bit tensors.
         """
         base_bits_k, base_bits_v = self._get_base_bits_for_layer(
             layer_idx=layer_idx,
@@ -727,40 +805,7 @@ class ZipCacheKVCompressorFlash:
             low_bits_k = self._step_down_bits(base_bits_k)
             low_bits_v = self._step_down_bits(base_bits_v)
 
-        # Start with all tokens using the base bitwidth.
-        bits_k = torch.full(
-            (batch_size, num_kv_heads, seq_len),
-            fill_value=base_bits_k,
-            dtype=dtype,
-            device=device,
-        )
-        bits_v = torch.full(
-            (batch_size, num_kv_heads, seq_len),
-            fill_value=base_bits_v,
-            dtype=dtype,
-            device=device,
-        )
-
-        # Apply ZipCache's "non-salient" indices to *lower* the bitwidth.
-        # zip_state.unimportant_ids_* are expected to have shape [B, H_kv, L_u]
-        # with entries in [0, T).
-        if zip_state is not None and zip_state.unimportant_ids_k is not None:
-            # Clamp indices just in case; invalid indices are ignored.
-            idx_k = zip_state.unimportant_ids_k.clamp_(0, seq_len - 1)
-            bits_k.scatter_(-1, idx_k, low_bits_k)
-
-        if zip_state is not None and zip_state.unimportant_ids_v is not None:
-            idx_v = zip_state.unimportant_ids_v.clamp_(0, seq_len - 1)
-            bits_v.scatter_(-1, idx_v, low_bits_v)
-
-        return {
-            "bits_k": bits_k,
-            "bits_v": bits_v,
-            "base_bits_k": base_bits_k,
-            "base_bits_v": base_bits_v,
-            "low_bits_k": low_bits_k,
-            "low_bits_v": low_bits_v,
-        }
+        return base_bits_k, base_bits_v, low_bits_k, low_bits_v
 
     # ------------------------------------------------------------------ #
     # Public API: compress / decompress (thin wrappers for now)
@@ -869,22 +914,11 @@ class ZipCacheKVCompressorFlash:
         B, H, T, D = key_states.shape
         device = key_states.device
 
-        # Decide base/low bits for this layer + current saliency state.
-        # We reuse the public bit-assignment helper so that base/low bits
-        # stay consistent between "policy only" and "real compression".
-        bits_info = self.assign_bits_for_tokens(
+        # Decide base/low bits for this layer in a lightweight way.
+        base_bits_k, base_bits_v, low_bits_k, low_bits_v = self.get_base_and_low_bits(
             layer_idx=layer_idx,
-            zip_state=zip_state,
             layer_quant_bits=layer_quant_bits,
-            seq_len=T,
-            num_kv_heads=H,
-            batch_size=B,
-            device=device,
         )
-        base_bits_k = bits_info["base_bits_k"]
-        base_bits_v = bits_info["base_bits_v"]
-        low_bits_k = bits_info["low_bits_k"]
-        low_bits_v = bits_info["low_bits_v"]
 
         # Snapshot indices at compression time (zip_state may evolve later).
         unimportant_ids_k = (
@@ -1465,54 +1499,6 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                     flush=True,
             )
 
-            # 2) Convert saliency into a per-token bitwidth policy.
-            #    For zipcache_only mode, this uses bits_high_k/v and bits_low_k/v
-            #    from the ZipCache config. For hybrid, it uses the KVTuner base
-            #    bits as "high" and the next lower candidate as "low".
-            bits_info = self.zip_compressor.assign_bits_for_tokens(
-                layer_idx=self.layer_idx,
-                zip_state=self.zip_state,
-                layer_quant_bits=(self.k_bits, self.v_bits),
-                seq_len=kv_seq_len,
-                num_kv_heads=self.num_key_value_heads,
-                batch_size=bsz,
-                device=hidden_states.device,
-            )
-
-            bits_k = bits_info["bits_k"]
-            bits_v = bits_info["bits_v"]
-
-            if DEBUG:
-                print(
-                    f"[DEBUG][Zip] bits assigned "
-                    f"layer={self.layer_idx} "
-                    f"bits_k_shape={tuple(self.zip_state.bits_k.shape) if self.zip_state.bits_k is not None else None} ",
-                    flush=True,
-                )
-
-            # 3) Store the policy in the layer state so that the KV quantization
-            #    path (or later debug tooling) can reuse it.
-            self.zip_state.bits_k = bits_k
-            self.zip_state.bits_v = bits_v
-
-            # ------------------------------------------------------------------
-            # Extra safety: verify that the per-token policy matches the current
-            # prefix length and head configuration.
-            # ------------------------------------------------------------------
-            assert bits_k.shape[0] == bsz and bits_k.shape[1] == self.num_key_value_heads, (
-                f"[ZipCache] bits_k batch/head mismatch: got {tuple(bits_k.shape)}, "
-                f"expected (B={bsz}, H_kv={self.num_key_value_heads}, T=kv_seq_len)"
-            )
-            assert bits_k.shape == bits_v.shape, (
-                f"[ZipCache] bits_k/bits_v shape mismatch: "
-                f"{tuple(bits_k.shape)} vs {tuple(bits_v.shape)}"
-            )
-            # Prompt length should be aligned with the KV sequence length at prefill.
-            assert self.zip_state.prompt_length == kv_seq_len, (
-                f"[ZipCache] prompt_length ({self.zip_state.prompt_length}) "
-                f"!= kv_seq_len ({kv_seq_len}) at prefill."
-            )
-
         # use_sliding_windows = (
         #     _flash_supports_window_size
         #     and hasattr(self.config, "sliding_window") is not None
@@ -1561,10 +1547,6 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 value_mn = None
                 value_states_full = value_hist
 
-                # Full sequence that should be written back into the ZipCache after this step.
-                key_states_all = torch.cat([key_hist, key_states], dim=2)
-                value_states_all = torch.cat([value_hist, value_states], dim=2)
-
             # import ipdb; ipdb.set_trace()
 
             if key_states_quant_trans is not None:
@@ -1579,6 +1561,11 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 key_states_full = torch.cat([key_states_full, key_states], dim=2)
             else:
                 key_states_full = key_states
+
+            # For ZipCache decode, reuse the full K buffer as the canonical
+            # "all tokens" tensor to be recompressed into ZipCache.
+            if self.quant_mode in ("zipcache_only", "hybrid") and "key_hist" in locals():
+                key_states_all = key_states_full
 
             key_states_full_repeat = repeat_kv(key_states_full, self.num_key_value_groups)
             att_qkfull = torch.matmul(query_states, key_states_full_repeat.transpose(2, 3))
@@ -1628,7 +1615,7 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
             if self.quant_mode in ("zipcache_only", "hybrid") and not is_prefill:
                 assert getattr(self, "zip_saliency", None) is not None, "zip_saliency must be initialized in ZipCache modes"
                 assert getattr(self, "zip_state", None) is not None, "zip_state must be initialized in ZipCache modes"
-                
+
                 if DEBUG:
                     print(
                         f"[DEBUG][Zip] streaming update start "
@@ -1638,8 +1625,6 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                         flush=True,
                 )
 
-                # attn_weights has shape [batch, num_heads, q_len, total_seq_len].
-                # In typical decode, q_len == 1, so this is a single "row" per head.
                 self.zip_saliency.update_streaming(
                     attn_row=attn_weights,
                     layer_state=self.zip_state,
@@ -1656,6 +1641,12 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 
             value_states_full = torch.cat([value_states_full, value_states], dim=2)
             value_full_length = value_states_full.shape[-2]
+
+            # For ZipCache decode, the full V sequence used for recompression
+            # is exactly the updated full buffer.
+            if self.quant_mode in ("zipcache_only", "hybrid") and "value_hist" in locals():
+                value_states_all = value_states_full
+                
             if value_states_quant is None:
                 value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
                 attn_output = torch.matmul(attn_weights, value_states_full_repeat)
