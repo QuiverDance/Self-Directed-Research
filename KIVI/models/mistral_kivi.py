@@ -1584,11 +1584,15 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 zipcache_cfg=self.zipcache_config,
                 bit_candidates=None,
             )
+            # Dedicated CUDA stream for ZipCache saliency/quant work so it can
+            # overlap with the main attention/MLP compute.
+            self._zip_stream = None
         else:
             # In plain KVTuner-only mode we do not need any ZipCache helpers.
             self.zip_state = None
             self.zip_saliency = None
             self.zip_compressor = None
+            self._zip_stream = None
 
     def forward(
         self,
@@ -1671,14 +1675,28 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                     flush=True,
             )
 
-            # 1) Use probe tokens + normalized attention to estimate token saliency
-            #    and fill layer_state.unimportant_ids_k/v.
-            self.zip_saliency.init_prefill_saliency(
-                query_states=query_states,
-                key_states=key_states,
-                attention_mask=attention_mask,
-                layer_state=self.zip_state,
-            )
+            if not hidden_states.is_cuda:
+                self.zip_saliency.init_prefill_saliency(
+                    query_states=query_states,
+                    key_states=key_states,
+                    attention_mask=attention_mask,
+                    layer_state=self.zip_state,
+                )
+            else:
+                # create a dedicated ZipCache stream lazily.
+                zip_stream = getattr(self, "_zip_stream", None)
+                if zip_stream is None:
+                    zip_stream = torch.cuda.Stream(device=hidden_states.device)
+                    self._zip_stream = zip_stream
+
+                # run asynchronously to overlap with main attention computation.
+                with torch.cuda.stream(zip_stream):
+                    self.zip_saliency.init_prefill_saliency(
+                        query_states=query_states,
+                        key_states=key_states,
+                        attention_mask=attention_mask,
+                        layer_state=self.zip_state,
+                    )
 
             if DEBUG:
                 print(
@@ -1715,6 +1733,11 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 # downstream attention logic, but we do NOT reuse the KVTuner tuple layout.
                 assert getattr(self, "zip_compressor", None) is not None, "zip_compressor must be initialized in ZipCache modes"
                 assert getattr(self, "zip_state", None) is not None, "zip_state must be initialized in ZipCache modes"
+
+                if key_states.is_cuda:
+                    zip_stream = getattr(self, "_zip_stream", None)
+                    if zip_stream is not None:
+                        torch.cuda.current_stream(device=key_states.device).wait_stream(zip_stream)
 
                 key_hist, value_hist = self.zip_compressor.decompress(
                     kv_blob=past_key_value,
@@ -1964,33 +1987,68 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 assert getattr(self, "zip_compressor", None) is not None, "zip_compressor must be initialized in ZipCache modes"
                 assert getattr(self, "zip_state", None) is not None, "zip_state must be initialized in ZipCache modes"
 
-                if is_prefill:
+                # if not CUDA, do compression/append synchronously as before.
+                if not hidden_states.is_cuda:
                     # Prefill: compress the full prefix once.
-                    ks = key_states_all if key_states_all is not None else key_states
-                    vs = value_states_all if value_states_all is not None else value_states
+                    if is_prefill:
+                        ks = key_states_all if key_states_all is not None else key_states
+                        vs = value_states_all if value_states_all is not None else value_states
 
-                    past_key_value = self.zip_compressor.compress(
-                        key_states=ks,
-                        value_states=vs,
-                        zip_state=self.zip_state,
-                        layer_idx=self.layer_idx,
-                        layer_quant_bits=(self.k_bits, self.v_bits),
-                    )
+                        past_key_value = self.zip_compressor.compress(
+                            key_states=ks,
+                            value_states=vs,
+                            zip_state=self.zip_state,
+                            layer_idx=self.layer_idx,
+                            layer_quant_bits=(self.k_bits, self.v_bits),
+                        )
+                    else:
+                        # Decode: append only the newly generated tokens to the existing blob.
+                        ks_tail = key_states
+                        vs_tail = value_states
+
+                        past_key_value = self.zip_compressor.append(
+                            kv_blob=past_key_value,
+                            key_tail=ks_tail,
+                            value_tail=vs_tail,
+                            zip_state=self.zip_state,
+                            layer_idx=self.layer_idx,
+                            layer_quant_bits=(self.k_bits, self.v_bits),
+                        )
                 else:
-                    # Decode: append only the newly generated tokens to the existing blob.
-                    ks_tail = key_states
-                    vs_tail = value_states
+                    # if cuda, overlap compression/append with main attention compute.
+                    zip_stream = getattr(self, "_zip_stream", None)
+                    if zip_stream is None:
+                        zip_stream = torch.cuda.Stream(device=hidden_states.device)
+                        self._zip_stream = zip_stream
 
-                    past_key_value = self.zip_compressor.append(
-                        kv_blob=past_key_value,
-                        key_tail=ks_tail,
-                        value_tail=vs_tail,
-                        zip_state=self.zip_state,
-                        layer_idx=self.layer_idx,
-                        layer_quant_bits=(self.k_bits, self.v_bits),
-                    )
+                    if is_prefill:
+                        ks = key_states_all if key_states_all is not None else key_states
+                        vs = value_states_all if value_states_all is not None else value_states
+
+                        with torch.cuda.stream(zip_stream):
+                            past_key_value = self.zip_compressor.compress(
+                                key_states=ks,
+                                value_states=vs,
+                                zip_state=self.zip_state,
+                                layer_idx=self.layer_idx,
+                                layer_quant_bits=(self.k_bits, self.v_bits),
+                            )
+                    else:
+                        ks_tail = key_states
+                        vs_tail = value_states
+
+                        with torch.cuda.stream(zip_stream):
+                            past_key_value = self.zip_compressor.append(
+                                kv_blob=past_key_value,
+                                key_tail=ks_tail,
+                                value_tail=vs_tail,
+                                zip_state=self.zip_state,
+                                layer_idx=self.layer_idx,
+                                layer_quant_bits=(self.k_bits, self.v_bits),
+                            )
         else:
             past_key_value = None
+
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
