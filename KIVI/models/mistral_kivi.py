@@ -962,6 +962,193 @@ class ZipCacheKVCompressorFlash:
         }
         return kv_blob
 
+    def append(
+        self,
+        kv_blob: Any,
+        key_tail: torch.Tensor,
+        value_tail: torch.Tensor,
+        zip_state: "ZipCacheLayerState",
+        layer_idx: int,
+        layer_quant_bits: Optional[Tuple[int, int]],
+    ) -> Dict[str, Any]:
+        """Incrementally append newly generated tokens to an existing ZipCache kv_blob.
+
+        This assumes:
+          * kv_blob was produced by `compress` in this class (dict layout), and
+          * key_tail / value_tail share (B, H_kv, D) with the existing blob.
+
+        Only the new tokens are quantized; existing compressed codes are reused.
+        """
+        if kv_blob is None:
+            raise ValueError(
+                f"[ZipCacheKVCompressorFlash] append called with kv_blob=None at layer {layer_idx}"
+            )
+
+        # Legacy tuple layout → decompress + full recompress.
+        if not isinstance(kv_blob, dict) or "shape" not in kv_blob:
+            key_hist, value_hist = self.decompress(
+                kv_blob=kv_blob,
+                zip_state=zip_state,
+                layer_idx=layer_idx,
+                dtype=key_tail.dtype,
+            )
+            key_full = torch.cat([key_hist, key_tail], dim=2)
+            value_full = torch.cat([value_hist, value_tail], dim=2)
+            return self.compress(
+                key_states=key_full,
+                value_states=value_full,
+                zip_state=zip_state,
+                layer_idx=layer_idx,
+                layer_quant_bits=layer_quant_bits,
+            )
+
+        B_old, H_old, T_old, D_old = kv_blob["shape"]
+        B_new, H_new, T_new, D_new = key_tail.shape
+
+        # No new tokens: nothing to do.
+        if T_new == 0:
+            return kv_blob
+
+        # Basic shape sanity checks.
+        if (B_old, H_old, D_old) != (B_new, H_new, D_new):
+            raise ValueError(
+                f"[ZipCacheKVCompressorFlash] append shape mismatch at layer {layer_idx}: "
+                f"blob shape (B={B_old}, H={H_old}, D={D_old}), "
+                f"tail shape (B={B_new}, H={H_new}, D={D_new})."
+            )
+
+        T_total = T_old + T_new
+
+        # Reuse existing bitwidths and group size from the blob.
+        base_bits_k = int(kv_blob.get("base_bits_k", self.bits_high_k))
+        low_bits_k = int(kv_blob.get("low_bits_k", base_bits_k))
+        base_bits_v = int(kv_blob.get("base_bits_v", self.bits_high_v))
+        low_bits_v = int(kv_blob.get("low_bits_v", base_bits_v))
+
+        k_blob = kv_blob["key"]
+        v_blob = kv_blob["value"]
+
+        group_size = int(k_blob.get("group_size", self.cfg.get("group_size", 32)))
+        if group_size != int(v_blob.get("group_size", group_size)):
+            raise ValueError(
+                "[ZipCacheKVCompressorFlash] append expects key/value group_size to match"
+            )
+
+        def _append_one(
+            blob: Dict[str, Any],
+            tail_tensor: torch.Tensor,
+            base_bits: int,
+            low_bits: int,
+        ) -> Dict[str, Any]:
+            mode = blob.get("mode", "all_high")
+            unimportant_ids = blob.get("unimportant_ids", None)
+
+            # Case 1: no unimportant tokens → everything uses high bits.
+            if unimportant_ids is None or (
+                isinstance(unimportant_ids, torch.Tensor) and unimportant_ids.numel() == 0
+            ):
+                code_high_old = blob["code_high"]
+                scale_high_old = blob["scale_high"]
+                mn_high_old = blob["mn_high"]
+
+                code_high_tail, scale_high_tail, mn_high_tail = quant_and_pack_vcache(
+                    tail_tensor.contiguous(),
+                    group_size=group_size,
+                    bits=base_bits,
+                )
+
+                code_high = torch.cat([code_high_old, code_high_tail], dim=2)
+                scale_high = torch.cat([scale_high_old, scale_high_tail], dim=2)
+                mn_high = torch.cat([mn_high_old, mn_high_tail], dim=2)
+
+                new_blob = dict(blob)
+                new_blob.update(
+                    dict(
+                        mode="all_high",
+                        code_high=code_high,
+                        scale_high=scale_high,
+                        mn_high=mn_high,
+                        code_low=None,
+                        scale_low=None,
+                        mn_low=None,
+                        unimportant_ids=None,
+                        shape=(B_old, H_old, T_total, D_old),
+                        group_size=group_size,
+                        bits_high=int(base_bits),
+                        bits_low=int(low_bits),
+                    )
+                )
+                return new_blob
+
+            # Case 2: mixed mode (some unimportant tokens in the prefix).
+            # We keep the low group *unchanged* and treat all new tokens as
+            # important (high bits).
+            code_high_old = blob["code_high"]
+            scale_high_old = blob["scale_high"]
+            mn_high_old = blob["mn_high"]
+
+            code_high_tail, scale_high_tail, mn_high_tail = quant_and_pack_vcache(
+                tail_tensor.contiguous(),
+                group_size=group_size,
+                bits=base_bits,
+            )
+
+            code_high = torch.cat([code_high_old, code_high_tail], dim=2)
+            scale_high = torch.cat([scale_high_old, scale_high_tail], dim=2)
+            mn_high = torch.cat([mn_high_old, mn_high_tail], dim=2)
+
+            new_blob = dict(blob)
+            new_blob.update(
+                dict(
+                    mode="mixed",
+                    code_high=code_high,
+                    scale_high=scale_high,
+                    mn_high=mn_high,
+                    # low side and unimportant_ids remain valid for the prefix
+                    code_low=blob["code_low"],
+                    scale_low=blob["scale_low"],
+                    mn_low=blob["mn_low"],
+                    unimportant_ids=unimportant_ids,
+                    shape=(B_old, H_old, T_total, D_old),
+                    group_size=group_size,
+                    bits_high=int(base_bits),
+                    bits_low=int(low_bits),
+                )
+            )
+            return new_blob
+
+        k_blob_new = _append_one(
+            blob=k_blob,
+            tail_tensor=key_tail,
+            base_bits=base_bits_k,
+            low_bits=low_bits_k,
+        )
+        v_blob_new = _append_one(
+            blob=v_blob,
+            tail_tensor=value_tail,
+            base_bits=base_bits_v,
+            low_bits=low_bits_v,
+        )
+
+        meta = dict(kv_blob.get("meta", {}))
+        meta["layer_idx"] = int(meta.get("layer_idx", layer_idx))
+        meta["quant_mode"] = meta.get("quant_mode", self.quant_mode)
+        if "layer_quant_bits" not in meta:
+            meta["layer_quant_bits"] = layer_quant_bits
+        meta["prompt_length"] = int(getattr(zip_state, "prompt_length", meta.get("prompt_length", 0)))
+        meta["decode_counter"] = int(getattr(zip_state, "decode_counter", meta.get("decode_counter", 0)))
+
+        return {
+            "shape": (B_old, H_old, T_total, D_old),
+            "key": k_blob_new,
+            "value": v_blob_new,
+            "base_bits_k": int(base_bits_k),
+            "low_bits_k": int(low_bits_k),
+            "base_bits_v": int(base_bits_v),
+            "low_bits_v": int(low_bits_v),
+            "meta": meta,
+        }
+
     def _dequant_and_merge(
         self,
         blob: Dict[str, Any],
@@ -1774,21 +1961,34 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 )
             else:
                 # ZipCache-only / hybrid: store a ZipCache kv_blob instead of the KVTuner tuple.
-                # If we already built full KV (key_states_all/value_states_all), use that.
-                # Otherwise fall back to the current key/value states.
-                ks = key_states_all if key_states_all is not None else key_states
-                vs = value_states_all if value_states_all is not None else value_states
-
                 assert getattr(self, "zip_compressor", None) is not None, "zip_compressor must be initialized in ZipCache modes"
                 assert getattr(self, "zip_state", None) is not None, "zip_state must be initialized in ZipCache modes"
 
-                past_key_value = self.zip_compressor.compress(
-                    key_states=ks,
-                    value_states=vs,
-                    zip_state=self.zip_state,
-                    layer_idx=self.layer_idx,
-                    layer_quant_bits=(self.k_bits, self.v_bits),
-                )
+                if is_prefill:
+                    # Prefill: compress the full prefix once.
+                    ks = key_states_all if key_states_all is not None else key_states
+                    vs = value_states_all if value_states_all is not None else value_states
+
+                    past_key_value = self.zip_compressor.compress(
+                        key_states=ks,
+                        value_states=vs,
+                        zip_state=self.zip_state,
+                        layer_idx=self.layer_idx,
+                        layer_quant_bits=(self.k_bits, self.v_bits),
+                    )
+                else:
+                    # Decode: append only the newly generated tokens to the existing blob.
+                    ks_tail = key_states
+                    vs_tail = value_states
+
+                    past_key_value = self.zip_compressor.append(
+                        kv_blob=past_key_value,
+                        key_tail=ks_tail,
+                        value_tail=vs_tail,
+                        zip_state=self.zip_state,
+                        layer_idx=self.layer_idx,
+                        layer_quant_bits=(self.k_bits, self.v_bits),
+                    )
         else:
             past_key_value = None
 
