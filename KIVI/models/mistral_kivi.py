@@ -1815,8 +1815,6 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 value_mn = None
                 value_states_full = value_hist
 
-            # import ipdb; ipdb.set_trace()
-
             if key_states_quant_trans is not None:
                 key_states_quant_trans_repeat = repeat_kv_quant(key_states_quant_trans, self.num_key_value_groups)
                 key_scale_trans_repeat = repeat_kv_quant(key_scale_trans, self.num_key_value_groups)
@@ -1865,11 +1863,29 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 )
 
             if attention_mask is not None:
-                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                    raise ValueError(
-                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                    )
-                attn_weights = attn_weights + attention_mask
+                # if flash attention 2 is enabled, attention_mask comes in as 2D binary mask (0/1).
+                # Thus, we need to convert it to additive mask (0/-inf).
+                if attention_mask.dim() == 2:
+                    # attention_mask: [Batch, Total_Seq_Len] (1=Valid, 0=Padding)
+                    # Target: [Batch, 1, 1, Total_Seq_Len] (0=Valid, -inf=Padding)
+                    
+                    # 2D -> 4D E
+                    expanded_mask = attention_mask[:, None, None, :]
+                    
+                    # make binary mask(1/0) to additive mask(0/-inf)
+                    # (1.0 - mask) * min_dtype
+                    min_dtype = torch.finfo(attn_weights.dtype).min
+                    additive_mask = (1.0 - expanded_mask) * min_dtype
+                    
+                    attn_weights = attn_weights + additive_mask
+                else:
+                    # if additive mask is 4D
+                    if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                        raise ValueError(
+                            f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                        )
+                    attn_weights = attn_weights + attention_mask
+
                 attn_weights = torch.max(
                     attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
                 )
@@ -1982,9 +1998,9 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
             
             attn_output = self._flash_attention_forward(
                 query_states.transpose(1, 2), key_states_repeat.transpose(1, 2), 
-                value_states_repeat.transpose(1, 2), None, q_len, dropout=0.0
+                value_states_repeat.transpose(1, 2), attention_mask, q_len, dropout=0.0
             )
-
+            
             if DEBUG:
                 print(
                     f"[DEBUG][FlashKIVI] layer={self.layer_idx} flash_attn done",
