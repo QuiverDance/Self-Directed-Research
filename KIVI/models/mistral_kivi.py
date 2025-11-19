@@ -117,6 +117,10 @@ class ZipCacheLayerState:
         # Keep a shallow copy of the ZipCache config if present (useful for debugging).
         self.config: Optional[Dict[str, Any]] = dict(config) if config is not None else None
 
+        # Flag indicating that the existing ZipCache kv_blob should be
+        # recompressed using the latest streaming saliency statistics.
+        self.needs_streaming_recompress: bool = False
+
     def reset_streaming(self) -> None:
         """
         Reset streaming-related state.
@@ -131,6 +135,10 @@ class ZipCacheLayerState:
         # reset, we also drop any existing bit maps so that they will be recomputed.
         self.bits_k = None
         self.bits_v = None
+
+        # Drop any pending recompression request; a new streaming window will
+        # compute fresh saliency / bit policies.
+        self.needs_streaming_recompress = False
 
 
 class ZipCacheSaliencyControllerFlash:
@@ -154,7 +162,6 @@ class ZipCacheSaliencyControllerFlash:
 
         # Configuration knobs taken from the kv_quant_config.json `zipcache` section.
         self.streaming_gap: int = int(cfg.get("streaming_gap", 100))
-        self.prefill_keep_ratio: float = float(cfg.get("prefill_keep_ratio", 0.4))
         self.k_unimportant_ratio: float = float(cfg.get("k_unimportant_ratio", 0.5))
         self.v_unimportant_ratio: float = float(cfg.get("v_unimportant_ratio", 0.5))
         self.probe_ratio_recent: float = float(cfg.get("probe_ratio_recent", 0.05))
@@ -165,9 +172,8 @@ class ZipCacheSaliencyControllerFlash:
 
     def _validate_ratios(self) -> None:
         """Sanity-check that all ratio-like parameters are within [0, 1]."""
-        assert 0.0 <= self.prefill_keep_ratio <= 1.0, "prefill_keep_ratio must be in [0, 1]"
         for name in ("k_unimportant_ratio", "v_unimportant_ratio", "probe_ratio_recent", "probe_ratio_random"):
-            value = getattr(self, name)
+            value = float(getattr(self, name))
             assert 0.0 <= value <= 1.0, f"{name} must be in [0, 1]"
 
     @torch.no_grad()
@@ -206,7 +212,7 @@ class ZipCacheSaliencyControllerFlash:
                 num_q_heads % num_kv_heads == 0
             ), f"Incompatible num_heads={num_q_heads} and num_kv_heads={num_kv_heads} for ZipCache saliency"
             group = num_q_heads // num_kv_heads
-            # [B, H_q, T, D] -> [B, H_kv, group, T, D] -> mean over group → [B, H_kv, T, D]
+            # [B, H_q, T, D] -> [B, H_kv, group, T, D] -> mean over group -> [B, H_kv, T, D]
             query_for_saliency = (
                 query_states.reshape(batch_size, num_kv_heads, group, seq_len, head_dim)
                 .mean(dim=2)
@@ -220,9 +226,9 @@ class ZipCacheSaliencyControllerFlash:
             print(
                 f"[DEBUG][ZipSaliency] prefill enter "
                 f"B={batch_size} H={num_heads} T={seq_len} "
-                f"prefill_keep_ratio={self.prefill_keep_ratio}",
+                f"k_unimp={self.k_unimportant_ratio} v_unimp={self.v_unimportant_ratio}",
                 flush=True,
-        )
+            )
 
         # Record the prompt length so that decode can distinguish new tokens
         # from the original prefix, and reset any streaming state.
@@ -230,7 +236,7 @@ class ZipCacheSaliencyControllerFlash:
         layer_state.reset_streaming()
 
         # Degenerate cases: no tokens or "keep everything" => nothing to drop.
-        if seq_len == 0 or self.prefill_keep_ratio >= 1.0:
+        if seq_len == 0 or (self.k_unimportant_ratio <= 0.0 and self.v_unimportant_ratio <= 0.0):
             layer_state.unimportant_ids_k = None
             layer_state.unimportant_ids_v = None
             return
@@ -269,83 +275,136 @@ class ZipCacheSaliencyControllerFlash:
             probe_idx = torch.unique(torch.cat(probe_indices, dim=0)).sort().values
 
         # ------------------------------------------------------------------
-        # 2) Compute attention of probe queries over the whole prefix: Q_probe @ K^T.
+        # 2) Compute Attention Scores & Saliency with Chunking
         # ------------------------------------------------------------------
-        # query_states: [B, H, T, D] -> pick probe positions on the time dimension.
-        q_probe = query_for_saliency.index_select(dim=2, index=probe_idx)  # [B, H, Q, D]
-        # key_states: [B, H, T, D]; batched matmul → [B, H, Q, T].
-        scores = torch.einsum("bhqd,bhkd->bhqk", q_probe, key_states) / math.sqrt(head_dim)
-        if DEBUG:
-            print(
-                f"[DEBUG][ZipSaliency] scores computed shape={tuple(scores.shape)}",
-                flush=True,
-        )
-        # ------------------------------------------------------------------
-        # 3) Apply attention mask (if any) and softmax.
-        # ------------------------------------------------------------------
+        # Prepare mask if necessary
+        key_mask_2d = None
+        mask = None
         if attention_mask is not None:
-            # Normalize various HF mask shapes (e.g. [B, T], [B, T, T], [B, 1, Q, T])
-            # into a 2D key-validity mask [B, T], where True means "token is valid".
             am = attention_mask
-
             if am.dim() == 2:
-                # Typical tokenizer mask: 1 for real tokens, 0 for padding.
                 if am.dtype.is_floating_point:
                     key_mask_2d = am > 0
                 else:
                     key_mask_2d = am.to(torch.bool)
             else:
-                # Additive or boolean masks with extra query/head axes.
-                # We interpret the last axis as "key" positions and treat a key as
-                # valid if it is attendable for at least one query position.
                 if am.dtype.is_floating_point:
-                    # In additive masks, 0 usually means "allowed" and negative
-                    # (e.g., -inf or -1e9) means "masked".
                     valid = am >= 0
                 else:
                     valid = am.to(torch.bool)
-
-                # Collapse all non-batch, non-key axes (query/head dimensions).
-                # Example shapes:
-                #   [B, T, T]       -> reduce over dim=1 -> [B, T]
-                #   [B, 1, Q, T]    -> reduce over dims=1,2 -> [B, T]
                 reduce_dims = tuple(range(1, valid.dim() - 1))
                 if reduce_dims:
                     key_mask_2d = valid.any(dim=reduce_dims)
                 else:
                     key_mask_2d = valid
+            
+            if key_mask_2d is not None:
+                # Lift to [B, 1, 1, T] to broadcast over [B, H, Chunk, T]
+                mask = key_mask_2d[:, None, None, :]
 
-            # Lift to [B, 1, 1, T] so it broadcasts over [B, H, Q, T].
-            mask = key_mask_2d[:, None, None, :]  # [B, 1, 1, T]
-            scores = scores.masked_fill(~mask, float("-inf"))
+        # Initialize accumulator for unnormalized saliency: [B, T]
+        raw_saliency = torch.zeros((batch_size, seq_len), device=device, dtype=torch.float32)
+        
+        # Process probes in small chunks to limit peak memory usage
+        chunk_size = 64 
+        num_probes = probe_idx.numel()
 
-        # Softmax over the last dimension to obtain attention distributions.
-        attn = torch.softmax(scores, dim=-1, dtype=torch.float32)  # [B, H, Q, T]
-
+        for i in range(0, num_probes, chunk_size):
+            end = min(i + chunk_size, num_probes)
+            chunk_indices = probe_idx[i:end] # [Chunk_Size]
+            
+            # Extract queries for this chunk: [B, H, Chunk, D]
+            q_chunk = query_for_saliency.index_select(dim=2, index=chunk_indices)
+            
+            # Compute attention scores: [B, H, Chunk, T]
+            # Note: We compute against ALL keys, but only for a subset of queries.
+            scores_chunk = torch.einsum("bhqd,bhkd->bhqk", q_chunk, key_states) / math.sqrt(head_dim)
+            
+            if mask is not None:
+                scores_chunk = scores_chunk.masked_fill(~mask, float("-inf"))
+            
+            # Softmax over the key dimension
+            attn_chunk = torch.softmax(scores_chunk, dim=-1, dtype=torch.float32)
+            
+            # Accumulate saliency: sum over heads (dim=1) and probes (dim=2) -> [B, T]
+            chunk_sum = attn_chunk.sum(dim=1).sum(dim=1)
+            raw_saliency += chunk_sum
+            
+            # Explicitly delete intermediate tensors to free VRAM immediately
+            del q_chunk, scores_chunk, attn_chunk, chunk_sum
+        
         # ------------------------------------------------------------------
-        # 4) Compute ZipCache-style normalized saliency per token.
+        # 3) Normalize Saliency
         # ------------------------------------------------------------------
-        saliency = self._compute_normalized_saliency(attn, probe_idx, seq_len)  # [B, T]
+        # Reconstruct "visible count" logic locally since we no longer have the full attn matrix.
+        # visible_count[j] = # { p in probe_idx | p >= j }
+        probe_idx_sorted = probe_idx # already sorted
+        if probe_idx_sorted.numel() == 0:
+            visible_count = torch.ones(seq_len, device=device, dtype=torch.float32)
+        else:
+            positions = torch.arange(seq_len, device=device)
+            # num_lt[j] = number of probe indices strictly smaller than j
+            num_lt = torch.bucketize(positions, probe_idx_sorted, right=False)
+            Q_int = int(probe_idx_sorted.numel())
+            visible_count = (Q_int - num_lt).to(torch.float32)
+            visible_count = torch.clamp(visible_count, min=1.0)
+
+        # Final normalized saliency: [B, T]
+        saliency = raw_saliency / visible_count.unsqueeze(0)
+
         if DEBUG:
             print(
                 f"[DEBUG][ZipSaliency] saliency computed shape={tuple(saliency.shape)}",
                 flush=True,
             )
+
         # ------------------------------------------------------------------
-        # 5) Select salient vs unimportant tokens based on prefill_keep_ratio.
+        # 4) Apply Tail Boosting (Optional)
         # ------------------------------------------------------------------
-        unimportant_ids = self._select_unimportant_from_saliency(
-            saliency=saliency,
-            keep_ratio=self.prefill_keep_ratio,
+        saliency_for_selection = saliency
+        T_total = saliency.size(1)
+        if self.tail_keep_length > 0 and T_total > self.tail_keep_length:
+            tail_len = min(self.tail_keep_length, T_total)
+            tail_start = T_total - tail_len
+            # Boost tail saliency so they are never picked as unimportant
+            max_per_batch, _ = saliency.max(dim=-1, keepdim=True)  # [B, 1]
+            boost = max_per_batch + 1.0
+            saliency_for_selection = saliency.clone()
+            saliency_for_selection[:, tail_start:] = boost.expand(-1, tail_len)
+            
+        # ------------------------------------------------------------------
+        # 5) Select salient vs unimportant tokens
+        # ------------------------------------------------------------------
+        keep_ratio_k = 1.0 - float(self.k_unimportant_ratio)
+        keep_ratio_v = 1.0 - float(self.v_unimportant_ratio)
+
+        unimportant_ids_k = self._select_unimportant_from_saliency(
+            saliency=saliency_for_selection,
+            keep_ratio=keep_ratio_k,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            device=device,
+        )
+        unimportant_ids_v = self._select_unimportant_from_saliency(
+            saliency=saliency_for_selection,
+            keep_ratio=keep_ratio_v,
             batch_size=batch_size,
             num_heads=num_heads,
             device=device,
         )
 
-        if unimportant_ids is None:
+        if unimportant_ids_k is None and unimportant_ids_v is None:
             layer_state.unimportant_ids_k = None
             layer_state.unimportant_ids_v = None
             return
+
+        # If V-specific selection fails, fall back to K's set.
+        layer_state.unimportant_ids_k = unimportant_ids_k
+        layer_state.unimportant_ids_v = (
+            unimportant_ids_v if unimportant_ids_v is not None else (
+                None if unimportant_ids_k is None else unimportant_ids_k.clone()
+            )
+        )
 
         if DEBUG:
             print(
@@ -354,11 +413,6 @@ class ZipCacheSaliencyControllerFlash:
                 f"unimp_v={None if layer_state.unimportant_ids_v is None else tuple(layer_state.unimportant_ids_v.shape)}",
                 flush=True,
             )
-
-        layer_state.unimportant_ids_k = unimportant_ids
-        # For now we treat K and V the same; if needed we can later decouple
-        # them using k_unimportant_ratio / v_unimportant_ratio.
-        layer_state.unimportant_ids_v = unimportant_ids.clone()
 
     def _compute_normalized_saliency(
         self,
@@ -672,6 +726,10 @@ class ZipCacheSaliencyControllerFlash:
         # If V-specific selection fails (e.g., all salient), fall back to K's set.
         layer_state.unimportant_ids_k = unimp_k
         layer_state.unimportant_ids_v = unimp_v if unimp_v is not None else unimp_k
+
+        # After refreshing streaming saliency, mark that the existing kv_blob
+        # should be recompressed using the updated unimportant token sets.
+        layer_state.needs_streaming_recompress = True
 
         # ------------------------------------------------------------------
         # 3) Reset the streaming window so that the next `streaming_gap` steps
@@ -1987,6 +2045,11 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                 assert getattr(self, "zip_compressor", None) is not None, "zip_compressor must be initialized in ZipCache modes"
                 assert getattr(self, "zip_state", None) is not None, "zip_state must be initialized in ZipCache modes"
 
+                zip_state = self.zip_state
+                needs_streaming_recompress = bool(
+                    getattr(zip_state, "needs_streaming_recompress", False)
+                )
+                
                 # if not CUDA, do compression/append synchronously as before.
                 if not hidden_states.is_cuda:
                     # Prefill: compress the full prefix once.
@@ -1997,23 +2060,38 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                         past_key_value = self.zip_compressor.compress(
                             key_states=ks,
                             value_states=vs,
-                            zip_state=self.zip_state,
+                            zip_state=zip_state,
                             layer_idx=self.layer_idx,
                             layer_quant_bits=(self.k_bits, self.v_bits),
                         )
                     else:
-                        # Decode: append only the newly generated tokens to the existing blob.
-                        ks_tail = key_states
-                        vs_tail = value_states
+                        # Decode: either recompress the full sequence (when streaming
+                        # saliency has been refreshed) or append only the newly
+                        # generated tokens to the existing blob.
+                        if (needs_streaming_recompress
+                            and key_states_all is not None
+                            and value_states_all is not None):
+                            past_key_value = self.zip_compressor.compress(
+                                key_states=key_states_all,
+                                value_states=value_states_all,
+                                zip_state=zip_state,
+                                layer_idx=self.layer_idx,
+                                layer_quant_bits=(self.k_bits, self.v_bits),
+                            )
+                            # This recompression request has been serviced.
+                            zip_state.needs_streaming_recompress = False
+                        else:
+                            ks_tail = key_states
+                            vs_tail = value_states
 
-                        past_key_value = self.zip_compressor.append(
-                            kv_blob=past_key_value,
-                            key_tail=ks_tail,
-                            value_tail=vs_tail,
-                            zip_state=self.zip_state,
-                            layer_idx=self.layer_idx,
-                            layer_quant_bits=(self.k_bits, self.v_bits),
-                        )
+                            past_key_value = self.zip_compressor.append(
+                                kv_blob=past_key_value,
+                                key_tail=ks_tail,
+                                value_tail=vs_tail,
+                                zip_state=zip_state,
+                                layer_idx=self.layer_idx,
+                                layer_quant_bits=(self.k_bits, self.v_bits),
+                            )
                 else:
                     # if cuda, overlap compression/append with main attention compute.
                     zip_stream = getattr(self, "_zip_stream", None)
@@ -2029,23 +2107,39 @@ class MistralFlashAttention_KIVI(MistralAttention_KIVI):
                             past_key_value = self.zip_compressor.compress(
                                 key_states=ks,
                                 value_states=vs,
-                                zip_state=self.zip_state,
+                                zip_state=zip_state,
                                 layer_idx=self.layer_idx,
                                 layer_quant_bits=(self.k_bits, self.v_bits),
                             )
                     else:
-                        ks_tail = key_states
-                        vs_tail = value_states
+                        # Decode: recompress full sequence if streaming saliency
+                        # was refreshed; otherwise just append the tail tokens.
+                        if (needs_streaming_recompress
+                            and key_states_all is not None
+                            and value_states_all is not None):
+                            with torch.cuda.stream(zip_stream):
+                                past_key_value = self.zip_compressor.compress(
+                                    key_states=key_states_all,
+                                    value_states=value_states_all,
+                                    zip_state=zip_state,
+                                    layer_idx=self.layer_idx,
+                                    layer_quant_bits=(self.k_bits, self.v_bits),
+                                )
+                            # Clear the flag now that recompression has completed.
+                            zip_state.needs_streaming_recompress = False
+                        else:
+                            ks_tail = key_states
+                            vs_tail = value_states
 
-                        with torch.cuda.stream(zip_stream):
-                            past_key_value = self.zip_compressor.append(
-                                kv_blob=past_key_value,
-                                key_tail=ks_tail,
-                                value_tail=vs_tail,
-                                zip_state=self.zip_state,
-                                layer_idx=self.layer_idx,
-                                layer_quant_bits=(self.k_bits, self.v_bits),
-                            )
+                            with torch.cuda.stream(zip_stream):
+                                past_key_value = self.zip_compressor.append(
+                                    kv_blob=past_key_value,
+                                    key_tail=ks_tail,
+                                    value_tail=vs_tail,
+                                    zip_state=zip_state,
+                                    layer_idx=self.layer_idx,
+                                    layer_quant_bits=(self.k_bits, self.v_bits),
+                                )
         else:
             past_key_value = None
 
